@@ -1,0 +1,5 @@
+sheepdog (0.2.0~0.git452bc6-1) unstable; urgency=low
+
+  * Initial release (Closes: #606134)
+
+ -- Guido Günther <agx@sigxcpu.org>  Tue, 07 Dec 2010 11:06:30 +0100

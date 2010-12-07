@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+%:
+	dh $@
+
+build: build-stamp
+build-stamp:
+	dh build --before configure
+	./autogen.sh
+	dh_auto_configure
+	dh build --after configure
+	touch build-stamp
+
