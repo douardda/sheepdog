@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -70,25 +70,21 @@ int rx(struct connection *conn, enum conn_state next_state)
 int tx(struct connection *conn, enum conn_state next_state, int flags)
 {
 	int ret;
-again:
+
 	ret = send(conn->fd, conn->tx_buf, conn->tx_length, flags);
 	if (ret < 0) {
-		if (errno == EAGAIN)
-			goto again;
-
-		conn->c_tx_state = C_IO_CLOSED;
+		if (errno != EAGAIN)
+			conn->c_tx_state = C_IO_CLOSED;
 		return 0;
 	}
 
 	conn->tx_length -= ret;
 	conn->tx_buf = (char *)conn->tx_buf + ret;
 
-	if (conn->tx_length)
-		goto again;
+	if (!conn->tx_length)
+		conn->c_tx_state = next_state;
 
-	conn->c_tx_state = next_state;
-
-	return 1;
+	return ret;
 }
 
 int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
@@ -146,18 +142,10 @@ int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
 			continue;
 		}
 
-		ret = fcntl(fd, F_GETFL);
+		ret = set_nonblocking(fd);
 		if (ret < 0) {
-			eprintf("can't fcntl (F_GETFL), %m\n");
 			close(fd);
 			continue;
-		} else {
-			ret = fcntl(fd, F_SETFL, ret | O_NONBLOCK);
-			if (ret < 0) {
-				eprintf("can't fcntl (O_NONBLOCK), %m\n");
-				close(fd);
-				continue;
-			}
 		}
 
 		ret = callback(fd, data);
@@ -367,4 +355,30 @@ char *addr_to_str(char *str, int size, uint8_t *addr, uint16_t port)
 	}
 
 	return str;
+}
+
+int set_nonblocking(int fd)
+{
+	int ret;
+
+	ret = fcntl(fd, F_GETFL);
+	if (ret < 0) {
+		eprintf("can't fcntl (F_GETFL), %m\n");
+		close(fd);
+	} else {
+		ret = fcntl(fd, F_SETFL, ret | O_NONBLOCK);
+		if (ret < 0)
+			eprintf("can't fcntl (O_NONBLOCK), %m\n");
+	}
+
+	return ret;
+}
+
+int set_nodelay(int fd)
+{
+	int ret, opt;
+
+	opt = 1;
+	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	return ret;
 }

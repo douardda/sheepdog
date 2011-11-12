@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -16,9 +16,14 @@
 #include "list.h"
 #include "net.h"
 
-#define SD_SHEEP_PROTO_VER 0x01
+#define SD_SHEEP_PROTO_VER 0x03
+
+#define SD_DEFAULT_REDUNDANCY 3
+#define SD_MAX_REDUNDANCY 8
 
 #define SD_MAX_NODES 1024
+#define SD_DEFAULT_VNODES 64
+#define SD_MAX_VNODES 65536
 #define SD_MAX_VMS   4096 /* FIXME: should be removed */
 
 #define SD_OP_SHEEP         0x80
@@ -30,9 +35,12 @@
 #define SD_OP_STAT_SHEEP     0x86
 #define SD_OP_STAT_CLUSTER   0x87
 #define SD_OP_KILL_NODE      0x88
+#define SD_OP_GET_VDI_ATTR   0x89
 
 #define SD_FLAG_CMD_DIRECT   0x10
 #define SD_FLAG_CMD_RECOVERY 0x20
+#define SD_FLAG_CMD_CREAT    0x40
+#define SD_FLAG_CMD_EXCL     0x80
 
 #define SD_RES_OLD_NODE_VER  0x41 /* Remote node has an old epoch */
 #define SD_RES_NEW_NODE_VER  0x42 /* Remote node has a new epoch */
@@ -75,10 +83,8 @@ struct sd_list_req {
 	uint32_t	epoch;
 	uint32_t        id;
 	uint32_t        data_length;
-	uint64_t        start;
-	uint64_t        end;
 	uint32_t        tgt_epoch;
-	uint32_t        pad[3];
+	uint32_t        pad[7];
 };
 
 struct sd_list_rsp {
@@ -89,9 +95,7 @@ struct sd_list_rsp {
 	uint32_t        id;
 	uint32_t        data_length;
 	uint32_t        result;
-	uint32_t        rsvd;
-	uint64_t        next;
-	uint32_t        pad[4];
+	uint32_t        pad[7];
 };
 
 struct sd_node_req {
@@ -120,18 +124,19 @@ struct sd_node_rsp {
 	uint64_t	store_free;
 };
 
-struct sheepdog_vm_list_entry {
-	uint8_t         name[SD_MAX_VDI_LEN];
-	uint8_t         host_addr[16];
-	uint16_t        host_port;
-	uint8_t	        pad[6];
+struct sheepdog_node_list_entry {
+	uint8_t         addr[16];
+	uint16_t        port;
+	uint16_t	nr_vnodes;
+	uint32_t	zone;
 };
 
-struct sheepdog_node_list_entry {
+struct sheepdog_vnode_list_entry {
 	uint64_t        id;
 	uint8_t         addr[16];
 	uint16_t        port;
-	uint16_t	pad[3];
+	uint16_t	node_idx;
+	uint32_t	zone;
 };
 
 struct epoch_log {
@@ -141,35 +146,74 @@ struct epoch_log {
 	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
 };
 
-static inline int hval_to_sheep(struct sheepdog_node_list_entry *entries,
+static inline int same_node(struct sheepdog_vnode_list_entry *e, int n1, int n2)
+{
+	if (memcmp(e[n1].addr, e[n2].addr, sizeof(e->addr)) == 0 &&
+	    e[n1].port == e[n2].port)
+		return 1;
+
+	return 0;
+}
+
+static inline int same_zone(struct sheepdog_vnode_list_entry *e, int n1, int n2)
+{
+	return e[n1].zone != 0 && e[n1].zone == e[n2].zone;
+}
+
+/* traverse the virtual node list and return the n'th one */
+static inline int get_nth_node(struct sheepdog_vnode_list_entry *entries,
+			       int nr_entries, int base, int n)
+{
+	int nodes[SD_MAX_REDUNDANCY];
+	int nr = 0, idx = base, i;
+
+	while (n--) {
+		nodes[nr++] = idx;
+next:
+		idx = (idx + 1) % nr_entries;
+		if (idx == base) {
+			abort();
+			return -1; /* not found */
+		}
+		for (i = 0; i < nr; i++) {
+			if (same_node(entries, idx, nodes[i]))
+				/* this node is already selected, so skip here */
+				goto next;
+			if (same_zone(entries, idx, nodes[i]))
+				/* this node is in the same zone, so skip here */
+				goto next;
+		}
+	}
+
+	return idx;
+}
+
+static inline int hval_to_sheep(struct sheepdog_vnode_list_entry *entries,
 				int nr_entries, uint64_t id, int idx)
 {
-	int i;
-	struct sheepdog_node_list_entry *e = entries, *n;
+	int i, ret;
+	struct sheepdog_vnode_list_entry *e = entries, *n;
 
 	for (i = 0; i < nr_entries - 1; i++, e++) {
 		n = e + 1;
 		if (id > e->id && id <= n->id)
 			break;
 	}
+	ret = get_nth_node(entries, nr_entries, (i + 1) % nr_entries, idx);
+	if (ret < 0) {
+		printf("bug\n");
+		abort();
+	}
 
-	return (i + 1 + idx) % nr_entries;
+	return ret;
 }
 
-static inline int obj_to_sheep(struct sheepdog_node_list_entry *entries,
+static inline int obj_to_sheep(struct sheepdog_vnode_list_entry *entries,
 			       int nr_entries, uint64_t oid, int idx)
 {
 	uint64_t id = fnv_64a_buf(&oid, sizeof(oid), FNV1A_64_INIT);
 
 	return hval_to_sheep(entries, nr_entries, id, idx);
-}
-
-static inline void print_node_list_entry(struct sheepdog_node_list_entry *e,
-					 char *str, size_t size)
-{
-	char  buf[INET6_ADDRSTRLEN];
-	snprintf(str, size, "%016" PRIx64 " - %s",
-		 e->id, addr_to_str(buf, sizeof(buf), e->addr, e->port));
 }
 
 static inline int is_sheep_op(uint8_t op)
@@ -223,6 +267,70 @@ static inline const char *sd_strerror(int err)
 			return errors[i].desc;
 
 	return "Invalid error code";
+}
+
+static inline int node_cmp(const void *a, const void *b)
+{
+	const struct sheepdog_node_list_entry *node1 = a;
+	const struct sheepdog_node_list_entry *node2 = b;
+	int cmp;
+
+	cmp = memcmp(node1->addr, node2->addr, sizeof(node1->addr));
+	if (cmp != 0)
+		return cmp;
+
+	if (node1->port < node2->port)
+		return -1;
+	if (node1->port > node2->port)
+		return 1;
+	return 0;
+}
+
+static inline int vnode_cmp(const void *a, const void *b)
+{
+	const struct sheepdog_vnode_list_entry *node1 = a;
+	const struct sheepdog_vnode_list_entry *node2 = b;
+
+	if (node1->id < node2->id)
+		return -1;
+	if (node1->id > node2->id)
+		return 1;
+	return 0;
+}
+
+static inline int nodes_to_vnodes(struct sheepdog_node_list_entry *nodes, int nr,
+				  struct sheepdog_vnode_list_entry *vnodes)
+{
+	struct sheepdog_node_list_entry *n = nodes;
+	int i, j, nr_vnodes = 0;
+	uint64_t hval;
+
+	while (nr--) {
+		hval = FNV1A_64_INIT;
+
+		for (i = 0; i < n->nr_vnodes; i++) {
+			if (vnodes) {
+				hval = fnv_64a_buf(&n->port, sizeof(n->port), hval);
+				for (j = ARRAY_SIZE(n->addr) - 1; j >= 0; j--)
+					hval = fnv_64a_buf(&n->addr[j], 1, hval);
+
+				vnodes[nr_vnodes].id = hval;
+				memcpy(vnodes[nr_vnodes].addr, n->addr, sizeof(n->addr));
+				vnodes[nr_vnodes].port = n->port;
+				vnodes[nr_vnodes].node_idx = n - nodes;
+				vnodes[nr_vnodes].zone = n->zone;
+			}
+
+			nr_vnodes++;
+		}
+
+		n++;
+	}
+
+	if (vnodes)
+		qsort(vnodes, nr_vnodes, sizeof(*vnodes), vnode_cmp);
+
+	return nr_vnodes;
 }
 
 #endif

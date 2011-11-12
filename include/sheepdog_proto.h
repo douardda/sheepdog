@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -31,6 +31,7 @@
 
 #define SD_FLAG_CMD_WRITE    0x01
 #define SD_FLAG_CMD_COW      0x02
+#define SD_FLAG_CMD_TRUNCATE 0x04
 
 #define SD_RES_SUCCESS       0x00 /* Success */
 #define SD_RES_UNKNOWN       0x01 /* Unknown error */
@@ -71,14 +72,23 @@
 #define VDI_SPACE_SHIFT   32
 #define VDI_BIT (UINT64_C(1) << 63)
 #define VMSTATE_BIT (UINT64_C(1) << 62)
+#define VDI_ATTR_BIT (UINT64_C(1) << 61)
 #define MAX_DATA_OBJS (1ULL << 20)
-#define MAX_CHILDREN 1024
-#define SD_MAX_VDI_LEN 256
-#define SD_MAX_VDI_TAG_LEN 256
+#define MAX_CHILDREN 1024U
+#define SD_MAX_VDI_LEN 256U
+#define SD_MAX_VDI_TAG_LEN 256U
+#define SD_MAX_VDI_ATTR_KEY_LEN 256U
+#define SD_MAX_VDI_ATTR_VALUE_LEN (UINT64_C(1) << 22)
 #define SD_NR_VDIS   (1U << 24)
 #define SD_DATA_OBJ_SIZE (UINT64_C(1) << 22)
+#define SD_MAX_VDI_SIZE (SD_DATA_OBJ_SIZE * MAX_DATA_OBJS)
+#define SECTOR_SIZE (1U << 9)
 
 #define SD_INODE_SIZE (sizeof(struct sheepdog_inode))
+#define SD_INODE_HEADER_SIZE (sizeof(struct sheepdog_inode) - \
+			      sizeof(uint32_t) * MAX_DATA_OBJS)
+#define SD_ATTR_HEADER_SIZE (SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN + \
+			     sizeof(uint32_t) + SD_MAX_VDI_ATTR_KEY_LEN)
 #define CURRENT_VDI_ID 0
 
 struct sd_req {
@@ -152,7 +162,9 @@ struct sd_vdi_rsp {
 	uint32_t        result;
 	uint32_t        rsvd;
 	uint32_t        vdi_id;
-	uint32_t        pad[5];
+	uint32_t        attr_id;
+	uint32_t        copies;
+	uint32_t        pad[3];
 };
 
 struct sheepdog_inode {
@@ -198,9 +210,30 @@ static inline int is_data_obj_writeable(struct sheepdog_inode *inode, int idx)
 	return inode->vdi_id == inode->data_vdi_id[idx];
 }
 
+static inline int is_vdi_obj(uint64_t oid)
+{
+	return !!(oid & VDI_BIT);
+}
+
+static inline int is_vmstate_obj(uint64_t oid)
+{
+	return !!(oid & VMSTATE_BIT);
+}
+
+static inline int is_vdi_attr_obj(uint64_t oid)
+{
+	return !!(oid & VDI_ATTR_BIT);
+}
+
 static inline int is_data_obj(uint64_t oid)
 {
-	return !(VDI_BIT & oid);
+	return !is_vdi_obj(oid) && !is_vmstate_obj(oid) &&
+		!is_vdi_attr_obj(oid);
+}
+
+static inline uint64_t data_oid_to_idx(uint64_t oid)
+{
+	return oid & (MAX_DATA_OBJS - 1);
 }
 
 static inline uint64_t vid_to_vdi_oid(uint32_t vid)
@@ -216,6 +249,11 @@ static inline uint64_t vid_to_data_oid(uint32_t vid, uint32_t idx)
 static inline uint32_t oid_to_vid(uint64_t oid)
 {
 	return (~VDI_BIT & oid) >> VDI_SPACE_SHIFT;
+}
+
+static inline uint64_t vid_to_attr_oid(uint32_t vid, uint32_t attrid)
+{
+	return ((uint64_t)vid << VDI_SPACE_SHIFT) | VDI_ATTR_BIT | attrid;
 }
 
 #endif

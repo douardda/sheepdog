@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 
 #include "logger.h"
 
@@ -45,7 +46,7 @@ static void dolog(int prio, const char *func, int line, const char *fmt,
 
 static struct logarea *la;
 static char *log_name;
-static int log_level;
+static int log_level = LOG_INFO;
 static pid_t pid;
 static key_t semkey;
 
@@ -292,7 +293,7 @@ static void dolog(int prio, const char *func, int line, const char *fmt, va_list
 		ts.tv_nsec = 10000;
 
 		ops.sem_num = 0;
-		ops.sem_flg = 0;
+		ops.sem_flg = SEM_UNDO;
 		ops.sem_op = -1;
 		if (semop(la->semid, &ops, 1) < 0) {
 			syslog(LOG_ERR, "semop up failed %m");
@@ -343,7 +344,7 @@ static void log_flush(void)
 
 	while (!la->empty) {
 		ops.sem_num = 0;
-		ops.sem_flg = 0;
+		ops.sem_flg = SEM_UNDO;
 		ops.sem_op = -1;
 		if (semop(la->semid, &ops, 1) < 0) {
 			syslog(LOG_ERR, "semop up failed");
@@ -359,6 +360,15 @@ static void log_flush(void)
 		}
 		log_syslog(la->buff);
 	}
+}
+
+static void log_sigsegv(void)
+{
+	vprintf(SDOG_ERR "sheep logger exits abnormally, pid:%d\n", getpid());
+	log_flush();
+	closelog();
+	free_logarea();
+	exit(1);
 }
 
 int log_init(char *program_name, int size, int is_daemon, int level, char *outfile)
@@ -377,8 +387,10 @@ int log_init(char *program_name, int size, int is_daemon, int level, char *outfi
 
 		if (outfile) {
 			fd = open(outfile, O_CREAT | O_RDWR | O_APPEND, 0644);
-			if (fd < 0)
+			if (fd < 0) {
 				syslog(LOG_ERR, "failed to open %s\n", outfile);
+				return 1;
+			}
 		} else {
 			fd = -1;
 			openlog(log_name, 0, LOG_DAEMON);
@@ -420,10 +432,12 @@ int log_init(char *program_name, int size, int is_daemon, int level, char *outfi
 		}
 
 		/* flush on daemon's crash */
-		sa_new.sa_handler = (void*)log_flush;
+		sa_new.sa_handler = (void*)log_sigsegv;
 		sigemptyset(&sa_new.sa_mask);
 		sa_new.sa_flags = 0;
 		sigaction(SIGSEGV, &sa_new, &sa_old );
+
+		prctl(PR_SET_PDEATHSIG, SIGSEGV);
 
 		while (la->active) {
 			log_flush();
@@ -442,6 +456,8 @@ void log_close(void)
 		la->active = 0;
 		waitpid(pid, NULL, 0);
 
+		vprintf(SDOG_WARNING "sheep logger stopped, pid:%d\n", pid);
+		log_flush();
 		closelog();
 		free_logarea();
 	}

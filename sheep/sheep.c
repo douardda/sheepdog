@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
 #include <linux/limits.h>
 #include <sys/syslog.h>
 
@@ -32,11 +33,13 @@ static struct option const long_options[] = {
 	{"foreground", no_argument, NULL, 'f'},
 	{"loglevel", required_argument, NULL, 'l'},
 	{"debug", no_argument, NULL, 'd'},
+	{"directio", no_argument, NULL, 'D'},
+	{"zone", required_argument, NULL, 'z'},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
 
-static const char *short_options = "p:fl:dh";
+static const char *short_options = "p:fl:dDz:h";
 
 static void usage(int status)
 {
@@ -51,6 +54,8 @@ Sheepdog Daemon, version %s\n\
   -f, --foreground        make the program run in the foreground\n\
   -l, --loglevel          specify the message level printed by default\n\
   -d, --debug             print debug messages\n\
+  -D, --directio          use direct IO\n\
+  -z, --zone              specify the zone id\n\
   -h, --help              display this help and exit\n\
 ", PACKAGE_VERSION);
 	}
@@ -68,6 +73,10 @@ int main(int argc, char **argv)
 	int is_daemon = 1;
 	int log_level = LOG_INFO;
 	char path[PATH_MAX];
+	int64_t zone = -1;
+	char *p;
+
+	signal(SIGPIPE, SIG_IGN);
 
 	while ((ch = getopt_long(argc, argv, short_options, long_options,
 				 &longindex)) >= 0) {
@@ -85,6 +94,24 @@ int main(int argc, char **argv)
 			/* removed soon. use loglevel instead */
 			log_level = LOG_DEBUG;
 			break;
+		case 'D':
+			dprintf("direct IO mode\n");
+			sys->use_directio = 1;
+			break;
+		case 'z':
+			zone = strtol(optarg, &p, 10);
+			if (optarg == p) {
+				eprintf("%s is not an integer\n", optarg);
+				exit(1);
+			}
+
+			if (zone < 0 || UINT32_MAX < zone) {
+				eprintf("zone id must be between 0 and %u\n",
+					UINT32_MAX);
+				exit(1);
+			}
+			sys->this_node.zone = zone;
+			break;
 		case 'h':
 			usage(0);
 			break;
@@ -101,7 +128,10 @@ int main(int argc, char **argv)
 
 	srandom(port);
 
-	ret = init_store(dir);
+	if (is_daemon && daemon(0, 0))
+		exit(1);
+
+	ret = init_base_path(dir);
 	if (ret)
 		exit(1);
 
@@ -109,22 +139,30 @@ int main(int argc, char **argv)
 	if (ret)
 		exit(1);
 
-	if (is_daemon && daemon(0, 0))
+	ret = init_store(dir);
+	if (ret)
 		exit(1);
+
+	jrnl_recover();
 
 	ret = init_event(EPOLL_SIZE);
 	if (ret)
 		exit(1);
 
-	ret = init_work_queue(NR_WORKER_THREAD);
-	if (ret)
+	sys->cpg_wqueue = init_work_queue(1);
+	sys->gateway_wqueue = init_work_queue(NR_GW_WORKER_THREAD);
+	sys->io_wqueue = init_work_queue(NR_IO_WORKER_THREAD);
+	sys->recovery_wqueue = init_work_queue(1);
+	sys->deletion_wqueue = init_work_queue(1);
+	if (!sys->cpg_wqueue || !sys->gateway_wqueue || !sys->io_wqueue ||
+	    !sys->recovery_wqueue || !sys->deletion_wqueue)
 		exit(1);
 
 	ret = create_listen_port(port, sys);
 	if (ret)
 		exit(1);
 
-	ret = create_cluster(port);
+	ret = create_cluster(port, zone);
 	if (ret) {
 		eprintf("failed to create sheepdog cluster.\n");
 		exit(1);
@@ -132,7 +170,7 @@ int main(int argc, char **argv)
 
 	vprintf(SDOG_NOTICE "Sheepdog daemon (version %s) started\n", PACKAGE_VERSION);
 
-	while (sys->status != SD_STATUS_SHUTDOWN)
+	while (sys->status != SD_STATUS_SHUTDOWN || sys->nr_outstanding_reqs != 0)
 		event_loop(-1);
 
 	vprintf(SDOG_INFO "shutdown\n");

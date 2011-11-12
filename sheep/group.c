@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -14,6 +14,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <sys/epoll.h>
 #include <corosync/cpg.h>
 #include <corosync/cfg.h>
 
@@ -23,11 +24,6 @@
 #include "util.h"
 #include "logger.h"
 #include "work.h"
-
-struct vm {
-	struct sheepdog_vm_list_entry ent;
-	struct list_head list;
-};
 
 struct node {
 	uint32_t nodeid;
@@ -68,6 +64,17 @@ struct join_message {
 		uint32_t pid;
 		struct sheepdog_node_list_entry ent;
 	} nodes[SD_MAX_NODES];
+	uint32_t nr_leave_nodes;
+	struct {
+		uint32_t nodeid;
+		uint32_t pid;
+		struct sheepdog_node_list_entry ent;
+	} leave_nodes[SD_MAX_NODES];
+};
+
+struct leave_message {
+	struct message_header header;
+	uint32_t epoch;
 };
 
 struct vdi_op_message {
@@ -75,6 +82,11 @@ struct vdi_op_message {
 	struct sd_vdi_req req;
 	struct sd_vdi_rsp rsp;
 	uint8_t data[0];
+};
+
+struct mastership_tx_message {
+	struct message_header header;
+	uint32_t epoch;
 };
 
 struct work_deliver {
@@ -93,22 +105,20 @@ struct work_confchg {
 	struct cpg_address *joined_list;
 	size_t joined_list_entries;
 
-	uint32_t *failed_vdis;
-	int nr_failed_vdis;
 	int first_cpg_node;
 	int sd_node_left;
 };
 
 #define print_node_list(node_list)				\
 ({								\
-	struct node *node;					\
-	char name[128];						\
-	list_for_each_entry(node, node_list, list) {		\
+	struct node *__node;					\
+	char __name[128];						\
+	list_for_each_entry(__node, node_list, list) {		\
 		dprintf("%c nodeid: %x, pid: %d, ip: %s\n",	\
-			is_myself(&node->ent) ? 'l' : ' ',	\
-			node->nodeid, node->pid,		\
-			addr_to_str(name, sizeof(name),		\
-			node->ent.addr, node->ent.port));	\
+			is_myself(__node->ent.addr, __node->ent.port) ? 'l' : ' ',	\
+			__node->nodeid, __node->pid,		\
+			addr_to_str(__name, sizeof(__name),	\
+			__node->ent.addr, __node->ent.port));	\
 	}							\
 })
 
@@ -137,16 +147,29 @@ CPG_EVENT_WORK_FNS(RUNNING, running)
 CPG_EVENT_WORK_FNS(SUSPENDED, suspended)
 CPG_EVENT_WORK_FNS(JOINING, joining)
 
-static int node_cmp(const void *a, const void *b)
+static inline int join_message(struct message_header *m)
 {
-	const struct sheepdog_node_list_entry *node1 = a;
-	const struct sheepdog_node_list_entry *node2 = b;
+	return m->op == SD_MSG_JOIN;
+}
 
-	if (node1->id < node2->id)
-		return -1;
-	if (node1->id > node2->id)
-		return 1;
-	return 0;
+static inline int vdi_op_message(struct message_header *m)
+{
+	return m->op == SD_MSG_VDI_OP;
+}
+
+static inline int master_chg_message(struct message_header *m)
+{
+	return m->op == SD_MSG_MASTER_CHANGED;
+}
+
+static inline int leave_message(struct message_header *m)
+{
+	return m->op == SD_MSG_LEAVE;
+}
+
+static inline int master_tx_message(struct message_header *m)
+{
+	return m->op == SD_MSG_MASTER_TRANSFER;
 }
 
 static int send_message(cpg_handle_t handle, struct message_header *msg)
@@ -159,9 +182,9 @@ static int send_message(cpg_handle_t handle, struct message_header *msg)
 retry:
 	ret = cpg_mcast_joined(handle, CPG_TYPE_AGREED, &iov, 1);
 	switch (ret) {
-	case CS_OK:
+	case CPG_OK:
 		break;
-	case CS_ERR_TRY_AGAIN:
+	case CPG_ERR_TRY_AGAIN:
 		dprintf("failed to send message. try again\n");
 		sleep(1);
 		goto retry;
@@ -183,31 +206,65 @@ static int get_node_idx(struct sheepdog_node_list_entry *ent,
 	return ent - entries;
 }
 
-static int build_node_list(struct list_head *node_list,
-			   struct sheepdog_node_list_entry *entries)
+static void build_node_list(struct list_head *node_list,
+			    struct sheepdog_node_list_entry *entries,
+			    int *nr_nodes, int *nr_zones)
 {
 	struct node *node;
-	int nr = 0;
+	int nr = 0, i;
+	uint32_t zones[SD_MAX_REDUNDANCY];
+
+	if (nr_zones)
+		*nr_zones = 0;
 
 	list_for_each_entry(node, node_list, list) {
 		if (entries)
 			memcpy(entries + nr, &node->ent, sizeof(*entries));
 		nr++;
+
+		if (nr_zones && *nr_zones < ARRAY_SIZE(zones)) {
+			for (i = 0; i < *nr_zones; i++) {
+				if (zones[i] == node->ent.zone)
+					break;
+			}
+			if (i == *nr_zones)
+				zones[(*nr_zones)++] = node->ent.zone;
+		}
 	}
 	if (entries)
 		qsort(entries, nr, sizeof(*entries), node_cmp);
-
-	return nr;
+	if (nr_nodes)
+		*nr_nodes = nr;
 }
 
 int get_ordered_sd_node_list(struct sheepdog_node_list_entry *entries)
 {
-	return build_node_list(&sys->sd_node_list, entries);
+	int nr_nodes;
+
+	build_node_list(&sys->sd_node_list, entries, &nr_nodes, NULL);
+
+	return nr_nodes;
 }
 
-int setup_ordered_sd_node_list(struct request *req)
+void get_ordered_sd_vnode_list(struct sheepdog_vnode_list_entry *entries,
+			       int *nr_vnodes, int *nr_zones)
 {
-	return get_ordered_sd_node_list(req->entry);
+	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
+	int nr;
+
+	build_node_list(&sys->sd_node_list, nodes, &nr, nr_zones);
+
+	if (sys->nr_vnodes == 0)
+		sys->nr_vnodes = nodes_to_vnodes(nodes, nr, sys->vnodes);
+
+	memcpy(entries, sys->vnodes, sizeof(*entries) * sys->nr_vnodes);
+
+	*nr_vnodes = sys->nr_vnodes;
+}
+
+void setup_ordered_sd_vnode_list(struct request *req)
+{
+	get_ordered_sd_vnode_list(req->entry, &req->nr_vnodes, &req->nr_zones);
 }
 
 static void get_node_list(struct sd_node_req *req,
@@ -229,18 +286,21 @@ static void get_node_list(struct sd_node_req *req,
 	rsp->master_idx = get_node_idx(&node->ent, data, nr_nodes);
 }
 
-static void get_vm_list(struct sd_rsp *rsp, void *data)
+static int get_epoch(struct sd_obj_req *req,
+		      struct sd_obj_rsp *rsp, void *data)
 {
-	int nr_vms;
-	struct vm *vm;
-
-	struct sheepdog_vm_list_entry *p = data;
-	list_for_each_entry(vm, &sys->vm_list, list) {
-		*p++ = vm->ent;
+	int epoch = req->tgt_epoch;
+	int len, ret;
+	dprintf("%d\n", epoch);
+	len = epoch_log_read(epoch, (char *)data, req->data_length);
+	if (len == -1) {
+		ret = SD_RES_NO_TAG;
+		rsp->data_length = 0;
+	} else {
+		ret = SD_RES_SUCCESS;
+		rsp->data_length = len;
 	}
-
-	nr_vms = p - (struct sheepdog_vm_list_entry *)data;
-	rsp->data_length = nr_vms * sizeof(struct sheepdog_vm_list_entry);
+	return ret;
 }
 
 void cluster_queue_request(struct work *work, int idx)
@@ -250,31 +310,40 @@ void cluster_queue_request(struct work *work, int idx)
 	struct sd_rsp *rsp = (struct sd_rsp *)&req->rp;
 	struct vdi_op_message *msg;
 	struct epoch_log *log;
-	int ret = SD_RES_SUCCESS;
+	int ret = SD_RES_SUCCESS, i, max_logs, epoch;
 
 	eprintf("%p %x\n", req, hdr->opcode);
 
 	switch (hdr->opcode) {
+	case SD_OP_GET_EPOCH:
+		ret = get_epoch((struct sd_obj_req *)hdr,
+			  (struct sd_obj_rsp *)rsp, req->data);
+		break;
 	case SD_OP_GET_NODE_LIST:
 		get_node_list((struct sd_node_req *)hdr,
 			      (struct sd_node_rsp *)rsp, req->data);
 		break;
-	case SD_OP_GET_VM_LIST:
-		get_vm_list(rsp, req->data);
-		break;
 	case SD_OP_STAT_CLUSTER:
-		log = (struct epoch_log *)req->data;
+		max_logs = rsp->data_length / sizeof(*log);
+		epoch = get_latest_epoch();
+		rsp->data_length = 0;
+		for (i = 0; i < max_logs; i++) {
+			if (epoch <= 0)
+				break;
 
-		log->ctime = get_cluster_ctime();
-		log->epoch = get_latest_epoch();
-		log->nr_nodes = epoch_log_read(log->epoch, (char *)log->nodes,
-					       sizeof(log->nodes));
-		if (log->nr_nodes == -1) {
-			rsp->data_length = 0;
-			log->nr_nodes = 0;
-		} else{
-			rsp->data_length = sizeof(*log);
+			log = (struct epoch_log *)req->data + i;
+			log->epoch = epoch;
+			log->ctime = get_cluster_ctime();
+			log->nr_nodes = epoch_log_read(epoch, (char *)log->nodes,
+						       sizeof(log->nodes));
+			if (log->nr_nodes == -1)
+				log->nr_nodes = epoch_log_read_remote(epoch,
+								      (char *)log->nodes,
+								      sizeof(log->nodes));
+
+			rsp->data_length += sizeof(*log);
 			log->nr_nodes /= sizeof(log->nodes[0]);
+			epoch--;
 		}
 
 		switch (sys->status) {
@@ -329,21 +398,23 @@ forward:
 	free(msg);
 }
 
-static struct vm *lookup_vm(struct list_head *entries, char *name)
-{
-	struct vm *vm;
-
-	list_for_each_entry(vm, entries, list) {
-		if (!strcmp((char *)vm->ent.name, name))
-			return vm;
-	}
-
-	return NULL;
-}
-
 static void group_handler(int listen_fd, int events, void *data)
 {
-	cpg_dispatch(sys->handle, CPG_DISPATCH_ALL);
+	int ret;
+	if (events & EPOLLHUP) {
+		eprintf("Receive EPOLLHUP event. Is corosync stopped running?\n");
+		goto out;
+	}
+
+	ret = cpg_dispatch(sys->handle, CPG_DISPATCH_ALL);
+
+	if (ret == CPG_OK)
+		return;
+	else
+		eprintf("oops...some error occured inside corosync\n");
+out:
+	log_close();
+	exit(1);
 }
 
 static struct node *find_node(struct list_head *node_list, uint32_t nodeid, uint32_t pid)
@@ -366,9 +437,123 @@ static int is_master(void)
 		return 0;
 
 	node = list_first_entry(&sys->sd_node_list, struct node, list);
-	if (is_myself(&node->ent))
+	if (is_myself(node->ent.addr, node->ent.port))
 		return 1;
 	return 0;
+}
+
+static inline int get_nodes_nr_from(struct list_head *l)
+{
+	struct node *node;
+	int nr = 0;
+	list_for_each_entry(node, l, list) {
+		nr++;
+	}
+	return nr;
+}
+
+static int get_nodes_nr_epoch(int epoch)
+{
+	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
+	int nr;
+
+	nr = epoch_log_read(epoch, (char *)nodes, sizeof(nodes));
+	nr /= sizeof(nodes[0]);
+	return nr;
+}
+
+static struct sheepdog_node_list_entry *find_entry_list(struct sheepdog_node_list_entry *entry,
+							struct list_head *head)
+{
+	struct node *n;
+	list_for_each_entry(n, head, list)
+		if (node_cmp(&n->ent, entry) == 0)
+			return entry;
+
+	return NULL;
+
+}
+
+static struct sheepdog_node_list_entry *find_entry_epoch(struct sheepdog_node_list_entry *entry,
+							 int epoch)
+{
+	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
+	int nr, i;
+
+	nr = epoch_log_read(epoch, (char *)nodes, sizeof(nodes));
+	nr /= sizeof(nodes[0]);
+
+	for (i = 0; i < nr; i++)
+		if (node_cmp(&nodes[i], entry) == 0)
+			return entry;
+
+	return NULL;
+}
+
+static int add_node_to_leave_list(struct message_header *msg)
+{
+	int ret = SD_RES_SUCCESS;
+	int nr, i, le = get_latest_epoch();
+	LIST_HEAD(tmp_list);
+	struct node *n, *t;
+	struct join_message *jm;
+
+	if (leave_message(msg)) {
+		n = zalloc(sizeof(*n));
+		if (!n) {
+			ret = SD_RES_NO_MEM;
+			goto err;
+		}
+
+		if (find_entry_list(&msg->from, &sys->leave_list)
+		    || !find_entry_epoch(&msg->from, le)) {
+			free(n);
+			goto ret;
+		}
+
+		n->nodeid = msg->nodeid;
+		n->pid = msg->pid;
+		n->ent = msg->from;
+
+		list_add_tail(&n->list, &sys->leave_list);
+		goto ret;
+	} else if (join_message(msg)) {
+		jm = (struct join_message *)msg;
+		nr = jm->nr_leave_nodes;
+		for (i = 0; i < nr; i++) {
+			n = zalloc(sizeof(*n));
+			if (!n) {
+				ret = SD_RES_NO_MEM;
+				goto free;
+			}
+
+			if (find_entry_list(&jm->leave_nodes[i].ent, &sys->leave_list)
+			    || !find_entry_epoch(&jm->leave_nodes[i].ent, le)) {
+				free(n);
+				continue;
+			}
+
+			n->nodeid = jm->leave_nodes[i].nodeid;
+			n->pid = jm->leave_nodes[i].pid;
+			n->ent = jm->leave_nodes[i].ent;
+
+			list_add_tail(&n->list, &tmp_list);
+		}
+		list_splice_init(&tmp_list, &sys->leave_list);
+		goto ret;
+	} else {
+		ret = SD_RES_INVALID_PARMS;
+		goto err;
+	}
+free:
+	list_for_each_entry_safe(n, t, &tmp_list, list) {
+		free(n);
+	}
+ret:
+	dprintf("%d\n", get_nodes_nr_from(&sys->leave_list));
+	print_node_list(&sys->leave_list);
+err:
+	return ret;
 }
 
 static int get_cluster_status(struct sheepdog_node_list_entry *from,
@@ -377,10 +562,11 @@ static int get_cluster_status(struct sheepdog_node_list_entry *from,
 			      uint32_t *status, uint8_t *inc_epoch)
 {
 	int i;
-	int nr_local_entries;
+	int nr_local_entries, nr_leave_entries;
 	struct sheepdog_node_list_entry local_entries[SD_MAX_NODES];
 	struct node *node;
 	uint32_t local_epoch;
+	char str[256];
 
 	*status = sys->status;
 	if (inc_epoch)
@@ -395,37 +581,43 @@ static int get_cluster_status(struct sheepdog_node_list_entry *from,
 			break;
 
 		if (ctime != get_cluster_ctime()) {
-			eprintf("joining node has invalid ctime, %"PRIu64"\n", from->id);
+			eprintf("joining node has invalid ctime, %s\n",
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_INVALID_CTIME;
 		}
 
 		local_epoch = get_latest_epoch();
 		if (epoch > local_epoch) {
-			eprintf("sheepdog is running with older epoch, %"PRIu32" %"PRIu32" %"PRIu64"\n",
-				epoch, local_epoch, from->id);
+			eprintf("sheepdog is running with older epoch, %"PRIu32" %"PRIu32" %s\n",
+				epoch, local_epoch,
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_OLD_NODE_VER;
 		}
 		break;
 	case SD_STATUS_WAIT_FOR_FORMAT:
 		if (nr_entries != 0) {
-			eprintf("joining node is not clean, %"PRIu64"\n", from->id);
+			eprintf("joining node is not clean, %s\n",
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_NOT_FORMATTED;
 		}
 		break;
 	case SD_STATUS_WAIT_FOR_JOIN:
 		if (ctime != get_cluster_ctime()) {
-			eprintf("joining node has invalid ctime, %"PRIu64"\n", from->id);
+			eprintf("joining node has invalid ctime, %s\n",
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_INVALID_CTIME;
 		}
 
 		local_epoch = get_latest_epoch();
 		if (epoch > local_epoch) {
-			eprintf("sheepdog is waiting with older epoch, %"PRIu32" %"PRIu32" %"PRIu64"\n",
-				epoch, local_epoch, from->id);
+			eprintf("sheepdog is waiting with older epoch, %"PRIu32" %"PRIu32" %s\n",
+				epoch, local_epoch,
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_OLD_NODE_VER;
 		} else if (epoch < local_epoch) {
-			eprintf("sheepdog is waiting with newer epoch, %"PRIu32" %"PRIu32" %"PRIu64"\n",
-				epoch, local_epoch, from->id);
+			eprintf("sheepdog is waiting with newer epoch, %"PRIu32" %"PRIu32" %s\n",
+				epoch, local_epoch,
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_NEW_NODE_VER;
 		}
 
@@ -434,29 +626,38 @@ static int get_cluster_status(struct sheepdog_node_list_entry *from,
 		nr_local_entries /= sizeof(local_entries[0]);
 
 		if (nr_entries != nr_local_entries) {
-			eprintf("joining node has invalid epoch, %"PRIu32" %"PRIu64"\n",
-				epoch, from->id);
+			eprintf("joining node has invalid epoch, %"PRIu32" %s\n",
+				epoch,
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_INVALID_EPOCH;
 		}
 
 		if (memcmp(entries, local_entries, sizeof(entries[0]) * nr_entries) != 0) {
-			eprintf("joining node has invalid epoch, %"PRIu64"\n", from->id);
+			eprintf("joining node has invalid epoch, %s\n",
+				addr_to_str(str, sizeof(str), from->addr, from->port));
 			return SD_RES_INVALID_EPOCH;
 		}
 
-		nr_entries = 1;
-		list_for_each_entry(node, &sys->sd_node_list, list) {
-			nr_entries++;
+		nr_entries = get_nodes_nr_from(&sys->sd_node_list) + 1;
+
+		if (nr_entries != nr_local_entries) {
+			nr_leave_entries = get_nodes_nr_from(&sys->leave_list);
+			if (nr_local_entries == nr_entries + nr_leave_entries) {
+				/* Even though some nodes leave, we can make do with it.
+				 * Order cluster to do recovery right now.
+				 */
+				*inc_epoch = 1;
+				*status = SD_STATUS_OK;
+				return SD_RES_SUCCESS;
+			}
+			return SD_RES_SUCCESS;
 		}
 
-		if (nr_entries != nr_local_entries)
-			return SD_RES_SUCCESS;
-
 		for (i = 0; i < nr_local_entries; i++) {
-			if (local_entries[i].id == from->id)
+			if (node_cmp(local_entries + i, from) == 0)
 				goto next;
 			list_for_each_entry(node, &sys->sd_node_list, list) {
-				if (local_entries[i].id == node->ent.id)
+				if (node_cmp(local_entries + i, &node->ent) == 0)
 					goto next;
 			}
 			return SD_RES_SUCCESS;
@@ -494,7 +695,6 @@ static void join(struct join_message *msg)
 					 msg->epoch, &msg->cluster_status,
 					 &msg->inc_epoch);
 	msg->nr_sobjs = sys->nr_sobjs;
-	msg->epoch = sys->epoch;
 	msg->ctime = get_cluster_ctime();
 	msg->nr_nodes = 0;
 	list_for_each_entry(node, &sys->sd_node_list, list) {
@@ -505,56 +705,67 @@ static void join(struct join_message *msg)
 	}
 }
 
-static void get_vdi_bitmap_from_all(void)
+static int get_vdi_bitmap_from(struct sheepdog_node_list_entry *node)
 {
 	struct sd_req hdr;
 	struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
-	int i, j, ret, nr_nodes, fd;
-	/* fixme: we need this until starting up. */
 	static DECLARE_BITMAP(tmp_vdi_inuse, SD_NR_VDIS);
-	struct sheepdog_node_list_entry entry[SD_MAX_NODES];
+	int fd, i, ret = SD_RES_SUCCESS;
 	unsigned int rlen, wlen;
 	char host[128];
+
+	if (is_myself(node->addr, node->port))
+		goto out;
+
+	addr_to_str(host, sizeof(host), node->addr, 0);
+
+	fd = connect_to(host, node->port);
+	if (fd < 0) {
+		vprintf(SDOG_ERR "can't get the vdi bitmap %s, %m\n", host);
+		ret = -SD_RES_EIO;
+		goto out;
+	}
+
+	vprintf(SDOG_ERR "get the vdi bitmap from %s\n", host);
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.opcode = SD_OP_READ_VDIS;
+	hdr.epoch = sys->epoch;
+	hdr.data_length = sizeof(tmp_vdi_inuse);
+	rlen = hdr.data_length;
+	wlen = 0;
+
+	ret = exec_req(fd, &hdr, (char *)tmp_vdi_inuse,
+			&wlen, &rlen);
+
+	close(fd);
+
+	if (ret || rsp->result != SD_RES_SUCCESS) {
+		vprintf(SDOG_ERR "can't get the vdi bitmap %d %d\n", ret,
+				rsp->result);
+		goto out;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(sys->vdi_inuse); i++)
+		sys->vdi_inuse[i] |= tmp_vdi_inuse[i];
+out:
+	return ret;
+}
+
+static void get_vdi_bitmap_from_sd_list(void)
+{
+	int i, nr_nodes;
+	/* fixme: we need this until starting up. */
+	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
 
 	/*
 	 * we don't need the proper order but this is the simplest
 	 * way.
 	 */
-	nr_nodes = get_ordered_sd_node_list(entry);
+	nr_nodes = get_ordered_sd_node_list(nodes);
 
-	for (i = 0; i < nr_nodes; i++) {
-		if (is_myself(&entry[i]))
-			continue;
-
-		addr_to_str(host, sizeof(host), entry[i].addr, 0);
-
-		fd = connect_to(host, entry[i].port);
-		if (fd < 0) {
-			vprintf(SDOG_ERR "can't get the vdi bitmap %s, %m\n", host);
-		}
-
-		vprintf(SDOG_ERR "get the vdi bitmap %d %s\n", i, host);
-
-		memset(&hdr, 0, sizeof(hdr));
-		hdr.opcode = SD_OP_READ_VDIS;
-		hdr.epoch = sys->epoch;
-		hdr.data_length = sizeof(tmp_vdi_inuse);
-		rlen = hdr.data_length;
-		wlen = 0;
-
-		ret = exec_req(fd, &hdr, (char *)tmp_vdi_inuse,
-			       &wlen, &rlen);
-
-		close(fd);
-
-		if (ret || rsp->result != SD_RES_SUCCESS) {
-			vprintf(SDOG_ERR "can't get the vdi bitmap %d %d\n", ret,
-				rsp->result);
-		}
-
-		for (j = 0; j < ARRAY_SIZE(sys->vdi_inuse); j++)
-			sys->vdi_inuse[j] |= tmp_vdi_inuse[j];
-	}
+	for (i = 0; i < nr_nodes; i++)
+		get_vdi_bitmap_from(&nodes[i]);
 }
 
 static int move_node_to_sd_list(uint32_t nodeid, uint32_t pid,
@@ -566,25 +777,44 @@ static int move_node_to_sd_list(uint32_t nodeid, uint32_t pid,
 	if (!node)
 		return 1;
 
-	if (!node->ent.id)
-		node->ent = ent;
+	node->ent = ent;
 
 	list_del(&node->list);
 	list_add_tail(&node->list, &sys->sd_node_list);
+	sys->nr_vnodes = 0;
 
 	return 0;
+}
+
+static int update_epoch_log(int epoch)
+{
+	int ret, nr_nodes;
+	struct sheepdog_node_list_entry entry[SD_MAX_NODES];
+
+	nr_nodes = get_ordered_sd_node_list(entry);
+
+	dprintf("update epoch, %d, %d\n", epoch, nr_nodes);
+	ret = epoch_log_write(epoch, (char *)entry,
+			nr_nodes * sizeof(struct sheepdog_node_list_entry));
+	if (ret < 0)
+		eprintf("can't write epoch %u\n", epoch);
+
+	return ret;
 }
 
 static void update_cluster_info(struct join_message *msg)
 {
 	int i;
 	int ret, nr_nodes = msg->nr_nodes;
-	struct sheepdog_node_list_entry entry[SD_MAX_NODES];
 
+	eprintf("status = %d, epoch = %d, %d, %d\n", msg->cluster_status, msg->epoch, msg->result, sys->join_finished);
 	if (msg->result != SD_RES_SUCCESS) {
-		if (is_myself(&msg->header.from)) {
+		if (is_myself(msg->header.from.addr, msg->header.from.port)) {
 			eprintf("failed to join sheepdog, %d\n", msg->result);
-			sys->status = SD_STATUS_JOIN_FAILED;
+			leave_cluster();
+			eprintf("Restart me later when master is up, please.Bye.\n");
+			exit(1);
+			/* sys->status = SD_STATUS_JOIN_FAILED; */
 		}
 		return;
 	}
@@ -596,7 +826,7 @@ static void update_cluster_info(struct join_message *msg)
 		sys->nr_sobjs = msg->nr_sobjs;
 
 	if (sys->join_finished)
-		goto out;
+		goto join_finished;
 
 	sys->epoch = msg->epoch;
 	for (i = 0; i < nr_nodes; i++) {
@@ -612,20 +842,15 @@ static void update_cluster_info(struct join_message *msg)
 				msg->nodes[i].nodeid, msg->nodes[i].pid);
 	}
 
+	if (msg->cluster_status != SD_STATUS_OK)
+		add_node_to_leave_list((struct message_header *)msg);
+
 	sys->join_finished = 1;
 
-	eprintf("system status = %d, epoch = %d\n", msg->cluster_status, sys->epoch);
-	if (msg->cluster_status == SD_STATUS_OK) {
-		nr_nodes = get_ordered_sd_node_list(entry);
+	if (msg->cluster_status == SD_STATUS_OK && msg->inc_epoch)
+		update_epoch_log(sys->epoch);
 
-		dprintf("update epoch, %d, %d\n", sys->epoch, nr_nodes);
-		ret = epoch_log_write(sys->epoch, (char *)entry,
-				      nr_nodes * sizeof(struct sheepdog_node_list_entry));
-		if (ret < 0)
-			eprintf("can't write epoch %u\n", sys->epoch);
-	}
-
-out:
+join_finished:
 	ret = move_node_to_sd_list(msg->header.nodeid, msg->header.pid, msg->header.from);
 	/*
 	 * this should not happen since __sd_deliver() checks if the
@@ -637,20 +862,11 @@ out:
 
 	if (msg->cluster_status == SD_STATUS_OK) {
 		if (msg->inc_epoch) {
-			nr_nodes = get_ordered_sd_node_list(entry);
-
-			dprintf("update epoch, %d, %d\n", sys->epoch + 1, nr_nodes);
-			ret = epoch_log_write(sys->epoch + 1, (char *)entry,
-					      nr_nodes * sizeof(struct sheepdog_node_list_entry));
-			if (ret < 0)
-				eprintf("can't write epoch %u\n", sys->epoch + 1);
-
 			sys->epoch++;
-
+			update_epoch_log(sys->epoch);
 			update_epoch_store(sys->epoch);
 		}
 		if (sys->status != SD_STATUS_OK) {
-			get_vdi_bitmap_from_all();
 			set_global_nr_copies(sys->nr_sobjs);
 			set_cluster_ctime(msg->ctime);
 		}
@@ -668,20 +884,17 @@ static void vdi_op(struct vdi_op_message *msg)
 	struct sd_vdi_rsp *rsp = &msg->rsp;
 	void *data = msg->data;
 	int ret = SD_RES_SUCCESS;
-	uint32_t vid = 0;
+	uint32_t vid = 0, attrid = 0, nr_copies = sys->nr_sobjs;
 
 	switch (hdr->opcode) {
 	case SD_OP_NEW_VDI:
 		ret = add_vdi(hdr->epoch, data, hdr->data_length, hdr->vdi_size, &vid,
 			      hdr->base_vdi_id, hdr->copies,
-			      hdr->snapid);
+			      hdr->snapid, &nr_copies);
 		break;
 	case SD_OP_DEL_VDI:
-		if (lookup_vm(&sys->vm_list, (char *)data)) {
-			ret = SD_RES_VDI_LOCKED;
-			break;
-		}
-		ret = del_vdi(hdr->epoch, data, hdr->data_length, &vid, hdr->snapid);
+		ret = del_vdi(hdr->epoch, data, hdr->data_length, &vid,
+			      hdr->snapid, &nr_copies);
 		break;
 	case SD_OP_LOCK_VDI:
 	case SD_OP_GET_VDI_INFO:
@@ -689,9 +902,25 @@ static void vdi_op(struct vdi_op_message *msg)
 			ret = SD_RES_VER_MISMATCH;
 			break;
 		}
-		ret = lookup_vdi(hdr->epoch, data, hdr->data_length, &vid, hdr->snapid);
+		ret = lookup_vdi(hdr->epoch, data, hdr->data_length, &vid,
+				 hdr->snapid, &nr_copies);
 		if (ret != SD_RES_SUCCESS)
 			break;
+		break;
+	case SD_OP_GET_VDI_ATTR:
+		ret = lookup_vdi(hdr->epoch, data,
+				 min(SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN, hdr->data_length),
+				 &vid, hdr->snapid, &nr_copies);
+		if (ret != SD_RES_SUCCESS)
+			break;
+		/* the curernt vdi id can change if we take the snapshot,
+		   so we use the hash value of the vdi name as the vdi id */
+		vid = fnv_64a_buf(data, strlen(data), FNV1A_64_INIT);
+		vid &= SD_NR_VDIS - 1;
+		ret = get_vdi_attr(hdr->epoch, data, hdr->data_length, vid,
+				   &attrid, nr_copies,
+				   hdr->flags & SD_FLAG_CMD_CREAT,
+				   hdr->flags & SD_FLAG_CMD_EXCL);
 		break;
 	case SD_OP_RELEASE_VDI:
 		break;
@@ -707,6 +936,8 @@ static void vdi_op(struct vdi_op_message *msg)
 	}
 
 	rsp->vdi_id = vid;
+	rsp->attr_id = attrid;
+	rsp->copies = nr_copies;
 	rsp->result = ret;
 }
 
@@ -715,7 +946,6 @@ static void vdi_op_done(struct vdi_op_message *msg)
 	const struct sd_vdi_req *hdr = &msg->req;
 	struct sd_vdi_rsp *rsp = &msg->rsp;
 	void *data = msg->data;
-	struct vm *vm;
 	struct request *req;
 	int ret = msg->rsp.result;
 	int i, latest_epoch, nr_nodes;
@@ -734,41 +964,11 @@ static void vdi_op_done(struct vdi_op_message *msg)
 		break;
 	}
 	case SD_OP_DEL_VDI:
-	{
-		unsigned long nr = rsp->vdi_id;
-		vprintf(SDOG_INFO "done %d %ld\n", ret, nr);
-		clear_bit(nr, sys->vdi_inuse);
 		break;
-	}
 	case SD_OP_LOCK_VDI:
-		if (lookup_vm(&sys->vm_list, (char *)data)) {
-			ret = SD_RES_VDI_LOCKED;
-			break;
-		}
-
-		vm = zalloc(sizeof(*vm));
-		if (!vm) {
-			ret = SD_RES_UNKNOWN;
-			break;
-		}
-		strcpy((char *)vm->ent.name, (char *)data);
-		memcpy(vm->ent.host_addr, msg->header.from.addr,
-		       sizeof(vm->ent.host_addr));
-		vm->ent.host_port = msg->header.from.port;
-
-		list_add(&vm->list, &sys->vm_list);
-		break;
 	case SD_OP_RELEASE_VDI:
-		vm = lookup_vm(&sys->vm_list, (char *)data);
-		if (!vm) {
-			ret = SD_RES_VDI_NOT_LOCKED;
-			break;
-		}
-
-		list_del(&vm->list);
-		free(vm);
-		break;
 	case SD_OP_GET_VDI_INFO:
+	case SD_OP_GET_VDI_ATTR:
 		break;
 	case SD_OP_MAKE_FS:
 		sys->nr_sobjs = ((struct sd_so_req *)hdr)->copies;
@@ -781,6 +981,7 @@ static void vdi_op_done(struct vdi_op_message *msg)
 		latest_epoch = get_latest_epoch();
 		for (i = 1; i <= latest_epoch; i++)
 			remove_epoch(i);
+		memset(sys->vdi_inuse, 0, sizeof(sys->vdi_inuse));
 
 		sys->epoch = 1;
 		sys->recovered_epoch = 1;
@@ -793,7 +994,6 @@ static void vdi_op_done(struct vdi_op_message *msg)
 			eprintf("can't write epoch %u\n", sys->epoch);
 		update_epoch_store(sys->epoch);
 
-		set_nodeid(sys->this_node.id);
 		set_global_nr_copies(sys->nr_sobjs);
 
 		sys->status = SD_STATUS_OK;
@@ -806,7 +1006,7 @@ static void vdi_op_done(struct vdi_op_message *msg)
 		ret = SD_RES_UNKNOWN;
 	}
 out:
-	if (!is_myself(&msg->header.from))
+	if (!is_myself(msg->header.from.addr, msg->header.from.port))
 		return;
 
 	req = list_first_entry(&sys->pending_list, struct request, pending_list);
@@ -816,36 +1016,6 @@ out:
 	memcpy(&req->rp, rsp, sizeof(req->rp));
 	list_del(&req->pending_list);
 	req->done(req);
-}
-
-static void update_running_vm_state(struct cpg_event *cevent)
-{
-	struct work_deliver *w = container_of(cevent, struct work_deliver, cev);
-	struct message_header *m = w->msg;
-	struct sheepdog_vm_list_entry *e;
-	int nr, i;
-	struct vm *vm;
-
-	if (sys->join_finished)
-		goto out;
-
-	/* This is my JOIN message. */
-	vprintf(SDOG_DEBUG "we update the vm list\n");
-
-	nr = (m->msg_length - sizeof(*m)) / sizeof(*e);
-	e = (struct sheepdog_vm_list_entry *)(m + 1);
-
-	for (i = 0; i < nr; i++) {
-		vm = zalloc(sizeof(*vm));
-		if (!vm)
-			panic("failed to allocate memory for a vm\n");
-
-		vm->ent = e[i];
-		vprintf(SDOG_DEBUG "%d, got %s\n", i, e[i].name);
-		list_add(&vm->list, &sys->vm_list);
-	}
-out:
-	cevent->skip = 1;
 }
 
 static void __sd_deliver(struct cpg_event *cevent)
@@ -861,17 +1031,17 @@ static void __sd_deliver(struct cpg_event *cevent)
 		m->pid);
 
 	/*
-	 * we don't want to perform any deliver events until we
-	 * join; we wait for our JOIN message.
+	 * we don't want to perform any deliver events except mastership_tx event
+	 * until we join; we wait for our JOIN message.
 	 */
-	if (!sys->join_finished) {
+	if (!sys->join_finished && !master_tx_message(m)) {
 		if (m->pid != sys->this_pid || m->nodeid != sys->this_nodeid) {
 			cevent->skip = 1;
 			return;
 		}
 	}
 
-	if (m->op == SD_MSG_JOIN) {
+	if (join_message(m)) {
 		uint32_t nodeid = m->nodeid;
 		uint32_t pid = m->pid;
 
@@ -881,8 +1051,7 @@ static void __sd_deliver(struct cpg_event *cevent)
 			return;
 		}
 
-		if (!node->ent.id)
-			node->ent = m->from;
+		node->ent = m->from;
 	}
 
 	if (m->state == DM_INIT && is_master()) {
@@ -898,66 +1067,70 @@ static void __sd_deliver(struct cpg_event *cevent)
 		}
 	}
 
-	if (m->state == DM_CONT)
-		update_running_vm_state(cevent);
-	else if (m->state == DM_FIN) {
+	if (m->state == DM_FIN) {
 		switch (m->op) {
 		case SD_MSG_JOIN:
-			update_cluster_info((struct join_message *)m);
-			break;
-		default:
-			eprintf("unknown message %d\n", m->op);
+			if (((struct join_message *)m)->cluster_status == SD_STATUS_OK)
+				if (sys->status != SD_STATUS_OK) {
+					struct join_message *msg = (struct join_message *)m;
+					int i;
+
+					get_vdi_bitmap_from_sd_list();
+					get_vdi_bitmap_from(&m->from);
+					for (i = 0; i < msg->nr_nodes;i++)
+						get_vdi_bitmap_from(&msg->nodes[i].ent);
+			}
 			break;
 		}
 	}
+
+}
+
+static int tx_mastership(void)
+{
+	struct mastership_tx_message msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.header.proto_ver = SD_SHEEP_PROTO_VER;
+	msg.header.op = SD_MSG_MASTER_TRANSFER;
+	msg.header.state = DM_FIN;
+	msg.header.msg_length = sizeof(msg);
+	msg.header.from = sys->this_node;
+	msg.header.nodeid = sys->this_nodeid;
+	msg.header.pid = sys->this_pid;
+
+	return send_message(sys->handle, (struct message_header *)&msg);
 }
 
 static void send_join_response(struct work_deliver *w)
 {
 	struct message_header *m;
-	struct vm *vm;
-	struct sheepdog_vm_list_entry *e;
-	int i, nr = 2000;
-	char *buf;
-
-	/*
-	 * FIXME: we need to inform the node of the JOIN failure in
-	 * the case of OOM.
-	 */
-	buf = malloc(sizeof(*m) + sizeof(*e) * nr);
-	m = (struct message_header *)buf;
-	e = (struct sheepdog_vm_list_entry *)(buf + sizeof(*m));
-
-	i = 0;
-	m->state = DM_CONT;
-	m->pid = w->msg->pid;
-	m->nodeid = w->msg->nodeid;
-
-	vprintf(SDOG_DEBUG "%u %u\n", m->pid, m->nodeid);
-
-	list_for_each_entry(vm, &sys->vm_list, list) {
-		*e = vm->ent;
-		vprintf(SDOG_DEBUG "%d %s\n", i, e->name);
-		e++;
-		i++;
-
-		if (!(i % nr)) {
-			m->msg_length = sizeof(*m) + i * sizeof(*e);
-			send_message(sys->handle, m);
-			e = (struct sheepdog_vm_list_entry *)(buf + sizeof(*m));
-			i = 0;
-		}
-	}
-
-	if (i) {
-		m->msg_length = sizeof(*m) + i * sizeof(*e);
-		vprintf(SDOG_DEBUG "%d %d\n", i, m->msg_length);
-		send_message(sys->handle, m);
-	}
+	struct join_message *jm;
+	struct node *node;
 
 	m = w->msg;
-	join((struct join_message *)m);
+	jm = (struct join_message *)m;
+	join(jm);
 	m->state = DM_FIN;
+
+	dprintf("%d, %d\n", jm->result, jm->cluster_status);
+	if (jm->result == SD_RES_SUCCESS && jm->cluster_status != SD_STATUS_OK) {
+		jm->nr_leave_nodes = 0;
+		list_for_each_entry(node, &sys->leave_list, list) {
+			jm->leave_nodes[jm->nr_leave_nodes].nodeid = node->nodeid;
+			jm->leave_nodes[jm->nr_leave_nodes].pid = node->pid;
+			jm->leave_nodes[jm->nr_leave_nodes].ent = node->ent;
+			jm->nr_leave_nodes++;
+		}
+		print_node_list(&sys->leave_list);
+	} else if (jm->result != SD_RES_SUCCESS &&
+			jm->epoch > sys->epoch &&
+			jm->cluster_status == SD_STATUS_WAIT_FOR_JOIN) {
+		eprintf("Transfer mastership.\n");
+		tx_mastership();
+		eprintf("Restart me later when master is up, please.Bye.\n");
+		exit(1);
+	}
+	jm->epoch = sys->epoch;
 	send_message(sys->handle, m);
 }
 
@@ -967,9 +1140,63 @@ static void __sd_deliver_done(struct cpg_event *cevent)
 	struct message_header *m;
 	char name[128];
 	int do_recovery;
+	struct node *node, *t;
+	int nr, nr_local, nr_leave;
 
 	m = w->msg;
-	do_recovery = (m->state == DM_FIN && m->op == SD_MSG_JOIN);
+
+	if (m->state == DM_FIN) {
+		switch (m->op) {
+		case SD_MSG_JOIN:
+			update_cluster_info((struct join_message *)m);
+			break;
+		case SD_MSG_LEAVE:
+			node = find_node(&sys->sd_node_list, m->nodeid, m->pid);
+			if (node) {
+				sys->nr_vnodes = 0;
+
+				list_del(&node->list);
+				free(node);
+				if (sys->status == SD_STATUS_OK) {
+					sys->epoch++;
+					update_epoch_log(sys->epoch);
+					update_epoch_store(sys->epoch);
+				}
+			}
+		/* fall through */
+		case SD_MSG_MASTER_TRANSFER:
+			if (sys->status == SD_STATUS_WAIT_FOR_JOIN) {
+				add_node_to_leave_list(m);
+
+				/* Sheep needs this to identify itself as master.
+				 * Now mastership transfer is done.
+				 */
+				if (!sys->join_finished) {
+					sys->join_finished = 1;
+					move_node_to_sd_list(sys->this_nodeid, sys->this_pid, sys->this_node);
+					sys->epoch = get_latest_epoch();
+				}
+
+				nr_local = get_nodes_nr_epoch(sys->epoch);
+				nr = get_nodes_nr_from(&sys->sd_node_list);
+				nr_leave = get_nodes_nr_from(&sys->leave_list);
+
+				dprintf("%d == %d + %d \n", nr_local, nr, nr_leave);
+				if (nr_local == nr + nr_leave) {
+					sys->status = SD_STATUS_OK;
+					update_epoch_log(sys->epoch);
+					update_epoch_store(sys->epoch);
+				}
+			}
+			break;
+		default:
+			eprintf("unknown message %d\n", m->op);
+			break;
+		}
+	}
+
+	do_recovery = (m->state == DM_FIN &&
+		       (join_message(m) || leave_message(m)));
 
 	dprintf("op: %d, state: %u, size: %d, from: %s\n",
 		m->op, m->state, m->msg_length,
@@ -991,8 +1218,12 @@ static void __sd_deliver_done(struct cpg_event *cevent)
 		}
 	}
 
-	if (do_recovery && sys->status == SD_STATUS_OK)
-		start_recovery(sys->epoch, NULL, 0);
+	if (do_recovery && sys->status == SD_STATUS_OK) {
+		list_for_each_entry_safe(node, t, &sys->leave_list, list) {
+			list_del(&node->list);
+		}
+		start_recovery(sys->epoch);
+	}
 }
 
 static void sd_deliver(cpg_handle_t handle, const struct cpg_name *group_name,
@@ -1003,7 +1234,7 @@ static void sd_deliver(cpg_handle_t handle, const struct cpg_name *group_name,
 	struct message_header *m = msg;
 	char name[128];
 
-	dprintf("op: %d, state: %u, size: %d, from: %s, nodeid: %u, pid: %u\n",
+	dprintf("op: %d, state: %u, size: %d, from: %s, nodeid: %x, pid: %u\n",
 		m->op, m->state, m->msg_length,
 		addr_to_str(name, sizeof(name), m->from.addr, m->from.port),
 		nodeid, pid);
@@ -1025,7 +1256,7 @@ static void sd_deliver(cpg_handle_t handle, const struct cpg_name *group_name,
 	if (cpg_event_suspended() && m->state == DM_FIN) {
 		list_add(&cevent->cpg_event_list, &sys->cpg_event_siblings);
 		cpg_event_clear_suspended();
-		if (m->op == SD_MSG_JOIN)
+		if (join_message(m))
 			cpg_event_clear_joining();
 	} else
 		list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
@@ -1065,42 +1296,9 @@ static void del_node(struct cpg_address *addr, struct work_confchg *w)
 	if (node) {
 		int nr;
 		struct sheepdog_node_list_entry e[SD_MAX_NODES];
-		struct vm *vm, *n;
-		int ret, size;
-		uint32_t vid;
-		void *buf;
 
 		w->sd_node_left++;
-
-		size = sizeof(*w->failed_vdis) * 64;
-		w->failed_vdis = malloc(size);
-		list_for_each_entry_safe(vm, n, &sys->vm_list, list) {
-			if (memcmp(vm->ent.host_addr, node->ent.addr,
-				   sizeof(node->ent.addr)) != 0)
-				continue;
-			if (vm->ent.host_port != node->ent.port)
-				continue;
-
-			if (w->nr_failed_vdis * sizeof(*w->failed_vdis) >= size) {
-				size *= 2;
-				buf = realloc(w->failed_vdis, size);
-				if (!buf) {
-					eprintf("out of memory, %d\n", size);
-					break;
-				}
-				w->failed_vdis = buf;
-			}
-
-			ret = lookup_vdi(sys->epoch, (char *)vm->ent.name,
-					 sizeof(vm->ent.name), &vid, 0);
-			if (ret == SD_RES_SUCCESS)
-				w->failed_vdis[w->nr_failed_vdis++] = vid;
-			else
-				eprintf("cannot find vdi %s\n", vm->ent.name);
-
-			list_del(&vm->list);
-			free(vm);
-		}
+		sys->nr_vnodes = 0;
 
 		list_del(&node->list);
 		free(node);
@@ -1130,8 +1328,61 @@ static int is_my_cpg_addr(struct cpg_address *addr)
 		(sys->this_pid == addr->pid);
 }
 
+/*
+ * Check whether the majority of Sheepdog nodes are still alive or not
+ */
+static int check_majority(struct cpg_address *left_list,
+			  size_t left_list_entries)
+{
+	int nr_nodes = 0, nr_majority, nr_reachable = 0, i, fd;
+	struct node *node;
+	char name[INET6_ADDRSTRLEN];
+
+	if (left_list_entries == 0)
+		return 1; /* we don't need this check in this case */
+
+	nr_nodes = get_nodes_nr_from(&sys->sd_node_list);
+	nr_majority = nr_nodes / 2 + 1;
+
+	/* we need at least 3 nodes to handle network partition
+	 * failure */
+	if (nr_nodes < 3)
+		return 1;
+
+	list_for_each_entry(node, &sys->sd_node_list, list) {
+		for (i = 0; i < left_list_entries; i++) {
+			if (left_list[i].nodeid == node->nodeid &&
+			    left_list[i].pid == node->pid)
+				break;
+		}
+		if (i != left_list_entries)
+			continue;
+
+		addr_to_str(name, sizeof(name), node->ent.addr, 0);
+		fd = connect_to(name, node->ent.port);
+		if (fd < 0)
+			continue;
+
+		close(fd);
+		nr_reachable++;
+		if (nr_reachable >= nr_majority) {
+			dprintf("majority nodes are alive\n");
+			return 1;
+		}
+	}
+	dprintf("%d, %d, %d\n", nr_nodes, nr_majority, nr_reachable);
+	eprintf("majority nodes are not alive\n");
+	return 0;
+}
+
 static void __sd_confchg(struct cpg_event *cevent)
 {
+	struct work_confchg *w = container_of(cevent, struct work_confchg, cev);
+
+	if (!check_majority(w->left_list, w->left_list_entries)) {
+		eprintf("perhaps network partition failure has occurred\n");
+		abort();
+	}
 }
 
 static void send_join_request(struct cpg_address *addr, struct work_confchg *w)
@@ -1165,7 +1416,7 @@ static void send_join_request(struct cpg_address *addr, struct work_confchg *w)
 
 	send_message(sys->handle, (struct message_header *)&msg);
 
-	vprintf(SDOG_INFO "%u %u\n", sys->this_nodeid, sys->this_pid);
+	vprintf(SDOG_INFO "%x %u\n", sys->this_nodeid, sys->this_pid);
 }
 
 static void __sd_confchg_done(struct cpg_event *cevent)
@@ -1224,7 +1475,7 @@ static void __sd_confchg_done(struct cpg_event *cevent)
 		update_cluster_info(&msg);
 
 		if (sys->status == SD_STATUS_OK) /* sheepdog starts with one node */
-			start_recovery(sys->epoch, NULL, 0);
+			start_recovery(sys->epoch);
 
 		return;
 	}
@@ -1243,7 +1494,7 @@ skip_join:
 			panic("we can't handle the departure of multiple nodes %d, %Zd\n",
 			      w->sd_node_left, w->left_list_entries);
 
-		start_recovery(sys->epoch, w->failed_vdis, w->nr_failed_vdis);
+		start_recovery(sys->epoch);
 	}
 }
 
@@ -1255,7 +1506,6 @@ static void cpg_event_free(struct cpg_event *cevent)
 		free(w->member_list);
 		free(w->left_list);
 		free(w->joined_list);
-		free(w->failed_vdis);
 		free(w);
 		break;
 	}
@@ -1329,7 +1579,7 @@ static void cpg_event_done(struct work *work, int idx)
 	{
 		struct work_deliver *w = container_of(cevent, struct work_deliver, cev);
 
-		if (w->msg->state == DM_FIN && w->msg->op == SD_MSG_VDI_OP)
+		if (w->msg->state == DM_FIN && vdi_op_message(w->msg))
 			vdi_op_done((struct vdi_op_message *)w->msg);
 
 		/*
@@ -1357,7 +1607,7 @@ static void cpg_event_done(struct work *work, int idx)
 				}
 			}
 			cpg_event_set_suspended();
-			if (w->msg->op == SD_MSG_JOIN)
+			if (join_message(w->msg))
 				cpg_event_set_joining();
 		}
 	got_fin:
@@ -1375,8 +1625,13 @@ out:
 	cpg_event_free(cevent);
 	cpg_event_clear_running();
 
-	if (!list_empty(&sys->cpg_event_siblings) && !cpg_event_suspended())
-		start_cpg_event_work();
+	if (!list_empty(&sys->cpg_event_siblings)) {
+		if (cpg_event_joining())
+			/* io requests need to return SD_RES_NEW_NODE_VER */
+			start_cpg_event_work();
+		else if (!cpg_event_suspended())
+			start_cpg_event_work();
+	}
 }
 
 static int check_epoch(struct request *req)
@@ -1410,9 +1665,23 @@ int is_access_to_busy_objects(uint64_t oid)
 				eprintf("bug\n");
 			continue;
 		}
-		if (oid == req->local_oid[0] || oid == req->local_oid[1])
+		if (oid == req->local_oid)
 				return 1;
 	}
+	return 0;
+}
+
+static int __is_access_to_recoverying_objects(struct request *req)
+{
+	if (req->rq.flags & SD_FLAG_CMD_RECOVERY) {
+		if (req->rq.opcode != SD_OP_READ_OBJ)
+			eprintf("bug\n");
+		return 0;
+	}
+
+	if (is_recoverying_oid(req->local_oid))
+		return 1;
+
 	return 0;
 }
 
@@ -1424,12 +1693,7 @@ static int __is_access_to_busy_objects(struct request *req)
 		return 0;
 	}
 
-	if (is_access_to_busy_objects(req->local_oid[0]) ||
-	    is_access_to_busy_objects(req->local_oid[1]))
-		return 1;
-
-	if (is_recoverying_oid(req->local_oid[0]) ||
-	    is_recoverying_oid(req->local_oid[1]))
+	if (is_access_to_busy_objects(req->local_oid))
 		return 1;
 
 	return 0;
@@ -1468,6 +1732,21 @@ void start_cpg_event_work(void)
 	if (cpg_event_joining()) {
 		if (!cpg_event_suspended())
 			panic("should not happen\n");
+
+		if (cevent->ctype == CPG_EVENT_REQUEST) {
+			struct request *req = container_of(cevent, struct request, cev);
+			if (is_io_request(req->rq.opcode) && req->rq.flags & SD_FLAG_CMD_DIRECT) {
+				list_del(&cevent->cpg_event_list);
+
+				req->rp.result = SD_RES_NEW_NODE_VER;
+
+				/* TODO: cleanup */
+				list_add_tail(&req->r_wlist, &sys->outstanding_req_list);
+				sys->nr_outstanding_io++;
+
+				req->work.done(&req->work, 0);
+			}
+		}
 		return;
 	}
 
@@ -1477,12 +1756,28 @@ do_retry:
 	list_for_each_entry_safe(cevent, n, &sys->cpg_event_siblings, cpg_event_list) {
 		struct request *req = container_of(cevent, struct request, cev);
 
-		if (cevent->ctype != CPG_EVENT_REQUEST)
+		if (cevent->ctype == CPG_EVENT_DELIVER)
+			continue;
+		if (cevent->ctype == CPG_EVENT_CONCHG)
 			break;
 
 		list_del(&cevent->cpg_event_list);
 
 		if (is_io_request(req->rq.opcode)) {
+			int copies = sys->nr_sobjs;
+
+			if (copies > req->nr_zones)
+				copies = req->nr_zones;
+
+			if (__is_access_to_recoverying_objects(req)) {
+				if (req->rq.flags & SD_FLAG_CMD_DIRECT) {
+					req->rp.result = SD_RES_NEW_NODE_VER;
+					sys->nr_outstanding_io++; /* TODO: cleanup */
+					list_add_tail(&req->r_wlist, &failed_req_list);
+				} else
+					list_add_tail(&req->r_wlist, &sys->req_wait_for_obj_list);
+				continue;
+			}
 			if (__is_access_to_busy_objects(req)) {
 				list_add_tail(&req->r_wlist, &sys->req_wait_for_obj_list);
 				continue;
@@ -1492,7 +1787,10 @@ do_retry:
 
 			sys->nr_outstanding_io++;
 
-			if (req->rq.flags & SD_FLAG_CMD_DIRECT) {
+			if (is_access_local(req->entry, req->nr_vnodes,
+					    ((struct sd_obj_req *)&req->rq)->oid, copies) ||
+			    is_access_local(req->entry, req->nr_vnodes,
+					    ((struct sd_obj_req *)&req->rq)->cow_oid, copies)) {
 				int ret = check_epoch(req);
 				if (ret != SD_RES_SUCCESS) {
 					req->rp.result = ret;
@@ -1501,8 +1799,29 @@ do_retry:
 					continue;
 				}
 			}
+
+			if (!(req->rq.flags & SD_FLAG_CMD_DIRECT) &&
+			    req->rq.opcode == SD_OP_READ_OBJ) {
+				struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
+				uint32_t vdi_id = oid_to_vid(hdr->oid);
+				struct data_object_bmap *bmap;
+
+				req->check_consistency = 1;
+				if (!is_vdi_obj(hdr->oid)) {
+					list_for_each_entry(bmap, &sys->consistent_obj_list, list) {
+						if (bmap->vdi_id == vdi_id) {
+							if (test_bit(data_oid_to_idx(hdr->oid), bmap->dobjs))
+								req->check_consistency = 0;
+							break;
+						}
+					}
+				}
+			}
 		}
-		queue_work(&req->work);
+		if (req->rq.flags & SD_FLAG_CMD_DIRECT)
+			queue_work(sys->io_wqueue, &req->work);
+		else
+			queue_work(sys->gateway_wqueue, &req->work);
 	}
 
 	while (!list_empty(&failed_req_list)) {
@@ -1517,11 +1836,14 @@ do_retry:
 		goto do_retry;
 
 	if (cpg_event_running() || cpg_event_suspended() ||
-	    list_empty(&sys->cpg_event_siblings) || sys->nr_outstanding_io)
+	    list_empty(&sys->cpg_event_siblings))
 		return;
 
 	cevent = list_first_entry(&sys->cpg_event_siblings,
 				  struct cpg_event, cpg_event_list);
+
+	if (cevent->ctype == CPG_EVENT_CONCHG && sys->nr_outstanding_io)
+		return;
 
 	list_del(&cevent->cpg_event_list);
 	sys->cur_cevent = cevent;
@@ -1532,7 +1854,7 @@ do_retry:
 	cpg_event_work.fn = cpg_event_fn;
 	cpg_event_work.done = cpg_event_done;
 
-	queue_work(&cpg_event_work);
+	queue_work(sys->cpg_wqueue, &cpg_event_work);
 }
 
 static void sd_confchg(cpg_handle_t handle, const struct cpg_name *group_name,
@@ -1551,9 +1873,8 @@ static void sd_confchg(cpg_handle_t handle, const struct cpg_name *group_name,
 	dprintf("%zd %zd %zd\n", member_list_entries, left_list_entries,
 		joined_list_entries);
 	for (i = 0; i < member_list_entries; i++) {
-		dprintf("[%d] node_id: %d, pid: %d, reason: %d\n", i,
-			member_list[i].nodeid, member_list[i].pid,
-			member_list[i].reason);
+		dprintf("[%x] node_id: %x, pid: %d\n", i,
+			member_list[i].nodeid, member_list[i].pid);
 	}
 
 	if (sys->status == SD_STATUS_SHUTDOWN)
@@ -1606,7 +1927,7 @@ oom:
 	panic("failed to allocate memory for a confchg event\n");
 }
 
-static void set_addr(unsigned int nodeid, int port)
+static int set_addr(unsigned int nodeid, int port)
 {
 	int ret, nr;
 	corosync_cfg_handle_t handle;
@@ -1620,20 +1941,20 @@ static void set_addr(unsigned int nodeid, int port)
 	memset(sys->this_node.addr, 0, sizeof(sys->this_node.addr));
 
 	ret = corosync_cfg_initialize(&handle, NULL);
-	if (ret != CS_OK) {
+	if (ret != CPG_OK) {
 		vprintf(SDOG_ERR "failed to initiazize cfg %d\n", ret);
-		exit(1);
+		return -1;
 	}
 
 	ret = corosync_cfg_get_node_addrs(handle, nodeid, 1, &nr, &addr);
-	if (ret != CS_OK) {
+	if (ret != CPG_OK) {
 		vprintf(SDOG_ERR "failed to get addr %d\n", ret);
-		exit(1);
+		return -1;
 	}
 
 	if (!nr) {
 		vprintf(SDOG_ERR "we got no address\n");
-		exit(1);
+		return -1;
 	}
 
 	if (ss->ss_family == AF_INET6) {
@@ -1641,18 +1962,19 @@ static void set_addr(unsigned int nodeid, int port)
 		memcpy(sys->this_node.addr, saddr, 16);
 	} else if (ss->ss_family == AF_INET) {
 		saddr = &sin->sin_addr;
-		memcpy(sys->this_node.addr + 12, saddr, 16);
+		memcpy(sys->this_node.addr + 12, saddr, 4);
 	} else {
 		vprintf(SDOG_ERR "unknown protocol %d\n", ss->ss_family);
-		exit(1);
+		return -1;
 	}
 
 	inet_ntop(ss->ss_family, saddr, tmp, sizeof(tmp));
 
 	vprintf(SDOG_INFO "addr = %s, port = %d\n", tmp, port);
+	return 0;
 }
 
-int create_cluster(int port)
+int create_cluster(int port, int64_t zone)
 {
 	int fd, ret;
 	cpg_handle_t cpg_handle;
@@ -1661,55 +1983,49 @@ int create_cluster(int port)
 	unsigned int nodeid = 0;
 
 	ret = cpg_initialize(&cpg_handle, &cb);
-	if (ret != CS_OK) {
+	if (ret != CPG_OK) {
 		eprintf("Failed to initialize cpg, %d\n", ret);
 		eprintf("Is corosync running?\n");
 		return -1;
 	}
 
+	ret = cpg_local_get(cpg_handle, &nodeid);
+	if (ret != CPG_OK) {
+		eprintf("Failed to get the local node's identifier, %d\n", ret);
+		return 1;
+	}
+
 join_retry:
 	ret = cpg_join(cpg_handle, &group);
 	switch (ret) {
-	case CS_OK:
+	case CPG_OK:
 		break;
-	case CS_ERR_TRY_AGAIN:
+	case CPG_ERR_TRY_AGAIN:
 		dprintf("Failed to join the sheepdog group, try again\n");
 		sleep(1);
 		goto join_retry;
-	case CS_ERR_SECURITY:
+	case CPG_ERR_SECURITY:
 		eprintf("Permission error.\n");
-		exit(1);
+		return -1;
 	default:
 		eprintf("Failed to join the sheepdog group, %d\n", ret);
-		exit(1);
-		break;
-	}
-
-	ret = cpg_local_get(cpg_handle, &nodeid);
-	if (ret != CS_OK) {
-		eprintf("Failed to get the local node's identifier, %d\n", ret);
-		exit(1);
+		return -1;
 	}
 
 	sys->handle = cpg_handle;
 	sys->this_nodeid = nodeid;
 	sys->this_pid = getpid();
 
-	set_addr(nodeid, port);
+	ret = set_addr(nodeid, port);
+	if (ret)
+		return 1;
 	sys->this_node.port = port;
-
-	ret = get_nodeid(&sys->this_node.id);
-	if (!sys->this_node.id) {
-		uint64_t hval;
-		int i;
-
-		hval = fnv_64a_buf(&sys->this_node.port,
-				   sizeof(sys->this_node.port),
-				   FNV1A_64_INIT);
-		for (i = ARRAY_SIZE(sys->this_node.addr) - 1; i >= 0; i--)
-			hval = fnv_64a_buf(&sys->this_node.addr[i], 1, hval);
-		sys->this_node.id = hval;
-	}
+	sys->this_node.nr_vnodes = SD_DEFAULT_VNODES;
+	if (zone == -1)
+		sys->this_node.zone = nodeid;
+	else
+		sys->this_node.zone = zone;
+	dprintf("zone id = %u\n", sys->this_node.zone);
 
 	if (get_latest_epoch() == 0)
 		sys->status = SD_STATUS_WAIT_FOR_FORMAT;
@@ -1717,16 +2033,43 @@ join_retry:
 		sys->status = SD_STATUS_WAIT_FOR_JOIN;
 	INIT_LIST_HEAD(&sys->sd_node_list);
 	INIT_LIST_HEAD(&sys->cpg_node_list);
-	INIT_LIST_HEAD(&sys->vm_list);
 	INIT_LIST_HEAD(&sys->pending_list);
+	INIT_LIST_HEAD(&sys->leave_list);
 
 	INIT_LIST_HEAD(&sys->outstanding_req_list);
 	INIT_LIST_HEAD(&sys->req_wait_for_obj_list);
+	INIT_LIST_HEAD(&sys->consistent_obj_list);
 
 	INIT_LIST_HEAD(&sys->cpg_event_siblings);
-	cpg_context_set(cpg_handle, sys);
 
-	cpg_fd_get(cpg_handle, &fd);
-	register_event(fd, group_handler, NULL);
+	ret = cpg_fd_get(cpg_handle, &fd);
+	if (ret != CPG_OK) {
+		eprintf("Failed to retrieve cpg file descriptor, %d\n", ret);
+		return 1;
+	}
+	ret = register_event(fd, group_handler, NULL);
+	if (ret) {
+		eprintf("Failed to register epoll events, %d\n", ret);
+		return 1;
+	}
 	return 0;
+}
+
+/* after this function is called, this node only works as a gateway */
+int leave_cluster(void)
+{
+	struct leave_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.header.proto_ver = SD_SHEEP_PROTO_VER;
+	msg.header.op = SD_MSG_LEAVE;
+	msg.header.state = DM_FIN;
+	msg.header.msg_length = sizeof(msg);
+	msg.header.from = sys->this_node;
+	msg.header.nodeid = sys->this_nodeid;
+	msg.header.pid = sys->this_pid;
+	msg.epoch = get_latest_epoch();
+
+	dprintf("%d\n", msg.epoch);
+	return send_message(sys->handle, (struct message_header *)&msg);
 }

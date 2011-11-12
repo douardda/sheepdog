@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
+#include <fcntl.h>
 
 #include "sheep_priv.h"
 
@@ -50,15 +51,21 @@ void resume_pending_requests(void)
 		start_cpg_event_work();
 }
 
-static int is_access_local(struct sheepdog_node_list_entry *e, int nr_nodes,
-			   uint64_t oid, int copies)
+int is_access_local(struct sheepdog_vnode_list_entry *e, int nr_nodes,
+		    uint64_t oid, int copies)
 {
 	int i, n;
+
+	if (oid == 0)
+		return 0;
+
+	if (copies > nr_nodes)
+		copies = nr_nodes;
 
 	for (i = 0; i < copies; i++) {
 		n = obj_to_sheep(e, nr_nodes, oid, i);
 
-		if (is_myself(&e[n]))
+		if (is_myself(e[n].addr, e[n].port))
 			return 1;
 	}
 
@@ -71,24 +78,18 @@ static void setup_access_to_local_objects(struct request *req)
 	int copies;
 
 	if (hdr->flags & SD_FLAG_CMD_DIRECT) {
-		req->local_oid[0] = hdr->oid;
-
-		if (hdr->flags & SD_FLAG_CMD_COW)
-			req->local_oid[1] = hdr->cow_oid;
-
+		req->local_oid = hdr->oid;
 		return;
 	}
 
 	copies = hdr->copies;
 	if (!copies)
 		copies = sys->nr_sobjs;
+	if (copies > req->nr_zones)
+		copies = req->nr_zones;
 
-	if (is_access_local(req->entry, req->nr_nodes, hdr->oid, copies))
-		req->local_oid[0] = hdr->oid;
-
-	if ((hdr->flags & SD_FLAG_CMD_COW) &&
-	    is_access_local(req->entry, req->nr_nodes, hdr->cow_oid, copies))
-		req->local_oid[1] = hdr->cow_oid;
+	if (is_access_local(req->entry, req->nr_vnodes, hdr->oid, copies))
+		req->local_oid = hdr->oid;
 }
 
 static void __done(struct work *work, int idx)
@@ -96,6 +97,10 @@ static void __done(struct work *work, int idx)
 	struct request *req = container_of(work, struct request, work);
 	struct sd_req *hdr = (struct sd_req *)&req->rq;
 	int again = 0;
+	int copies = sys->nr_sobjs;
+
+	if (copies > req->nr_zones)
+		copies = req->nr_zones;
 
 	switch (hdr->opcode) {
 	case SD_OP_NEW_VDI:
@@ -105,6 +110,7 @@ static void __done(struct work *work, int idx)
 	case SD_OP_GET_VDI_INFO:
 	case SD_OP_MAKE_FS:
 	case SD_OP_SHUTDOWN:
+	case SD_OP_GET_VDI_ATTR:
 		/* request is forwarded to cpg group */
 		return;
 	}
@@ -129,13 +135,64 @@ static void __done(struct work *work, int idx)
 		     req->rp.result == SD_RES_WAIT_FOR_FORMAT)) {
 
 			req->rq.epoch = sys->epoch;
-			req->nr_nodes = setup_ordered_sd_node_list(req);
+			setup_ordered_sd_vnode_list(req);
 			setup_access_to_local_objects(req);
 
 			list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
 			again = 1;
-		}
+		} else if (req->rp.result == SD_RES_SUCCESS && req->check_consistency) {
+			struct sd_obj_req *obj_hdr = (struct sd_obj_req *)&req->rq;
+			uint32_t vdi_id = oid_to_vid(obj_hdr->oid);
+			struct data_object_bmap *bmap, *n;
+			int nr_bmaps = 0;
 
+			if (!is_data_obj(obj_hdr->oid))
+				goto done;
+
+			list_for_each_entry_safe(bmap, n, &sys->consistent_obj_list, list) {
+				nr_bmaps++;
+				if (bmap->vdi_id == vdi_id) {
+					set_bit(data_oid_to_idx(obj_hdr->oid), bmap->dobjs);
+					list_del(&bmap->list);
+					list_add_tail(&bmap->list, &sys->consistent_obj_list);
+					goto done;
+				}
+			}
+			bmap = zalloc(sizeof(*bmap));
+			if (bmap == NULL) {
+				eprintf("out of memory\n");
+				goto done;
+			}
+			dprintf("allocate a new object map\n");
+			bmap->vdi_id = vdi_id;
+			list_add_tail(&bmap->list, &sys->consistent_obj_list);
+			set_bit(data_oid_to_idx(obj_hdr->oid), bmap->dobjs);
+			if (nr_bmaps >= MAX_DATA_OBJECT_BMAPS) {
+				/* the first entry is the least recently used one */
+				bmap = list_first_entry(&sys->consistent_obj_list,
+							struct data_object_bmap, list);
+				list_del(&bmap->list);
+				free(bmap);
+			}
+		} else if (is_access_local(req->entry, req->nr_vnodes,
+					   ((struct sd_obj_req *)&req->rq)->oid, copies) &&
+			   req->rp.result == SD_RES_EIO) {
+			eprintf("leave from cluster\n");
+			leave_cluster();
+
+			if (req->rq.flags & SD_FLAG_CMD_DIRECT)
+				/* hack to retry */
+				req->rp.result = SD_RES_NETWORK_ERROR;
+			else {
+				req->rq.epoch = sys->epoch;
+				setup_ordered_sd_vnode_list(req);
+				setup_access_to_local_objects(req);
+
+				list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
+				again = 1;
+			}
+		}
+done:
 		resume_pending_requests();
 		resume_recovery_work();
 	}
@@ -151,6 +208,8 @@ static void queue_request(struct request *req)
 	struct sd_req *hdr = (struct sd_req *)&req->rq;
 	struct sd_rsp *rsp = (struct sd_rsp *)&req->rp;
 
+	dprintf("%x\n", hdr->opcode);
+
 	if (hdr->opcode == SD_OP_KILL_NODE) {
 		log_close();
 		exit(1);
@@ -162,7 +221,13 @@ static void queue_request(struct request *req)
 		return;
 	}
 
-	if (sys->status == SD_STATUS_JOIN_FAILED) {
+	/*
+	 * we can know why this node failed to join with
+	 * SD_OP_STAT_CLUSTER, so the request should be handled even
+	 * when the cluster status is SD_STATUS_JOIN_FAILED
+	 */
+	if (sys->status == SD_STATUS_JOIN_FAILED &&
+	    hdr->opcode != SD_OP_STAT_CLUSTER) {
 		rsp->result = SD_RES_JOIN_FAILED;
 		req->done(req);
 		return;
@@ -197,7 +262,6 @@ static void queue_request(struct request *req)
 		req->work.fn = store_queue_request;
 		break;
 	case SD_OP_GET_NODE_LIST:
-	case SD_OP_GET_VM_LIST:
 	case SD_OP_NEW_VDI:
 	case SD_OP_DEL_VDI:
 	case SD_OP_LOCK_VDI:
@@ -206,6 +270,8 @@ static void queue_request(struct request *req)
 	case SD_OP_MAKE_FS:
 	case SD_OP_SHUTDOWN:
 	case SD_OP_STAT_CLUSTER:
+	case SD_OP_GET_VDI_ATTR:
+	case SD_OP_GET_EPOCH:
 		req->work.fn = cluster_queue_request;
 		break;
 	case SD_OP_READ_VDIS:
@@ -232,8 +298,9 @@ static void queue_request(struct request *req)
 	if (!(hdr->flags & SD_FLAG_CMD_DIRECT))
 		hdr->epoch = sys->epoch;
 
-	req->nr_nodes = setup_ordered_sd_node_list(req);
-	setup_access_to_local_objects(req);
+	setup_ordered_sd_vnode_list(req);
+	if (is_io_request(hdr->opcode))
+		setup_access_to_local_objects(req);
 
 	cevent->ctype = CPG_EVENT_REQUEST;
 	list_add_tail(&cevent->cpg_event_list, &sys->cpg_event_siblings);
@@ -247,17 +314,24 @@ static struct request *alloc_request(struct client_info *ci, int data_length)
 {
 	struct request *req;
 
-	req = zalloc(sizeof(struct request) + data_length);
+	req = zalloc(sizeof(struct request));
 	if (!req)
 		return NULL;
 
 	req->ci = ci;
 	client_incref(ci);
-	if (data_length)
-		req->data = (char *)req + sizeof(*req);
+	if (data_length) {
+		req->data = valloc(data_length);
+		if (!req->data) {
+			free(req);
+			return NULL;
+		}
+	}
 
 	list_add(&req->r_siblings, &ci->reqs);
 	INIT_LIST_HEAD(&req->r_wlist);
+
+	sys->nr_outstanding_reqs++;
 
 	return req;
 }
@@ -265,17 +339,27 @@ static struct request *alloc_request(struct client_info *ci, int data_length)
 static void free_request(struct request *req)
 {
 	list_del(&req->r_siblings);
+	free(req->data);
 	free(req);
+
+	sys->nr_outstanding_reqs--;
 }
 
 static void req_done(struct request *req)
 {
-	list_add(&req->r_wlist, &req->ci->done_reqs);
-	if (conn_tx_on(&req->ci->conn)) {
+	int dead = 0;
+	struct client_info *ci = req->ci;
+
+	if (conn_tx_on(&ci->conn)) {
 		dprintf("connection seems to be dead\n");
+		dead = 1;
+	} else
+		list_add(&req->r_wlist, &ci->done_reqs);
+
+	if (dead)
 		free_request(req);
-	}
-	client_decref(req->ci);
+
+	client_decref(ci);
 }
 
 static void init_rx_hdr(struct client_info *ci)
@@ -394,11 +478,7 @@ again:
 
 	switch (ci->conn.c_tx_state) {
 	case C_IO_HEADER:
-		if (rsp->data_length)
-			ret = tx(&ci->conn, C_IO_DATA_INIT, MSG_MORE);
-		else
-			ret = tx(&ci->conn, C_IO_DATA_INIT, 0);
-
+		ret = tx(&ci->conn, C_IO_DATA_INIT, 0);
 		if (!ret)
 			break;
 
@@ -477,7 +557,7 @@ static void client_handler(int fd, int events, void *data)
 	if (events & EPOLLIN)
 		client_rx_handler(ci);
 
-	if (!is_conn_dead(&ci->conn) && events & EPOLLOUT)
+	if (events & EPOLLOUT)
 		client_tx_handler(ci);
 
 	if (is_conn_dead(&ci->conn)) {
@@ -491,8 +571,14 @@ static void listen_handler(int listen_fd, int events, void *data)
 {
 	struct sockaddr_storage from;
 	socklen_t namesize;
-	int fd, ret, opt;
+	int fd, ret;
 	struct client_info *ci;
+
+	if (sys->status == SD_STATUS_SHUTDOWN) {
+		dprintf("unregister %d\n", listen_fd);
+		unregister_event(listen_fd);
+		return;
+	}
 
 	namesize = sizeof(from);
 	fd = accept(listen_fd, (struct sockaddr *)&from, &namesize);
@@ -501,8 +587,13 @@ static void listen_handler(int listen_fd, int events, void *data)
 		return;
 	}
 
-	opt = 1;
-	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	ret = set_nodelay(fd);
+	if (ret) {
+		close(fd);
+		return;
+	}
+
+	ret = set_nonblocking(fd);
 	if (ret) {
 		close(fd);
 		return;
@@ -533,8 +624,8 @@ int create_listen_port(int port, void *data)
 	return create_listen_ports(port, create_listen_port_fn, data);
 }
 
-int write_object(struct sheepdog_node_list_entry *e,
-		 int nodes, uint32_t node_version,
+int write_object(struct sheepdog_vnode_list_entry *e,
+		 int vnodes, int zones, uint32_t node_version,
 		 uint64_t oid, char *data, unsigned int datalen,
 		 uint64_t offset, int nr, int create)
 {
@@ -542,10 +633,25 @@ int write_object(struct sheepdog_node_list_entry *e,
 	int i, n, fd, ret, success = 0;
 	char name[128];
 
+	if (nr > zones)
+		nr = zones;
+
 	for (i = 0; i < nr; i++) {
 		unsigned rlen = 0, wlen = datalen;
 
-		n = obj_to_sheep(e, nodes, oid, i);
+		n = obj_to_sheep(e, vnodes, oid, i);
+
+		if (is_myself(e[n].addr, e[n].port)) {
+			ret = write_object_local(oid, data, datalen, offset, nr,
+						 node_version, create);
+
+			if (ret != 0)
+				eprintf("fail %"PRIx64" %"PRIx32"\n", oid, ret);
+			else
+				success++;
+
+			continue;
+		}
 
 		addr_to_str(name, sizeof(name), e[n].addr, 0);
 
@@ -580,20 +686,41 @@ int write_object(struct sheepdog_node_list_entry *e,
 	return !success;
 }
 
-int read_object(struct sheepdog_node_list_entry *e,
-		int nodes, uint32_t node_version,
+int read_object(struct sheepdog_vnode_list_entry *e,
+		int vnodes, int zones, uint32_t node_version,
 		uint64_t oid, char *data, unsigned int datalen,
 		uint64_t offset, int nr)
 {
 	struct sd_obj_req hdr;
 	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
 	char name[128];
-	int i = 0, n, fd, ret;
+	int i = 0, n, fd, ret, last_error = SD_RES_SUCCESS;
+
+	if (nr > zones)
+		nr = zones;
+
+	/* search a local object first */
+	for (i = 0; i < nr; i++) {
+		n = obj_to_sheep(e, vnodes, oid, i);
+
+		if (is_myself(e[n].addr, e[n].port)) {
+			ret = read_object_local(oid, data, datalen, offset, nr,
+						node_version);
+
+			if (ret < 0) {
+				eprintf("fail %"PRIx64" %"PRId32"\n", oid, ret);
+				return ret;
+			}
+
+			return ret;
+		}
+
+	}
 
 	for (i = 0; i < nr; i++) {
 		unsigned wlen = 0, rlen = datalen;
 
-		n = obj_to_sheep(e, nodes, oid, i);
+		n = obj_to_sheep(e, vnodes, oid, i);
 
 		addr_to_str(name, sizeof(name), e[n].addr, 0);
 
@@ -601,7 +728,7 @@ int read_object(struct sheepdog_node_list_entry *e,
 		if (fd < 0) {
 			printf("%s(%d): %s, %m\n", __func__, __LINE__,
 			       name);
-			return -1;
+			return -SD_RES_EIO;
 		}
 
 		memset(&hdr, 0, sizeof(hdr));
@@ -616,17 +743,22 @@ int read_object(struct sheepdog_node_list_entry *e,
 		ret = exec_req(fd, (struct sd_req *)&hdr, data, &wlen, &rlen);
 		close(fd);
 
-		if (!ret) {
-			if (rsp->result == SD_RES_SUCCESS)
-				return rsp->data_length;
+		if (ret) {
+			last_error = SD_RES_EIO;
+			continue;
 		}
+
+		if (rsp->result == SD_RES_SUCCESS)
+			return rsp->data_length;
+
+		last_error = rsp->result;
 	}
 
-	return -1;
+	return -last_error;
 }
 
-int remove_object(struct sheepdog_node_list_entry *e,
-		  int nodes, uint32_t node_version,
+int remove_object(struct sheepdog_vnode_list_entry *e,
+		  int vnodes, int zones, uint32_t node_version,
 		  uint64_t oid, int nr)
 {
 	char name[128];
@@ -634,13 +766,13 @@ int remove_object(struct sheepdog_node_list_entry *e,
 	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
 	int i = 0, n, fd, ret;
 
-	if (nr > nodes)
-		nr = nodes;
+	if (nr > zones)
+		nr = zones;
 
 	for (i = 0; i < nr; i++) {
 		unsigned wlen = 0, rlen = 0;
 
-		n = obj_to_sheep(e, nodes, oid, i);
+		n = obj_to_sheep(e, vnodes, oid, i);
 
 		addr_to_str(name, sizeof(name), e[n].addr, 0);
 
@@ -669,4 +801,64 @@ int remove_object(struct sheepdog_node_list_entry *e,
 		return -1;
 
 	return 0;
+}
+
+int get_sheep_fd(uint8_t *addr, uint16_t port, int node_idx,
+		 uint32_t epoch, int worker_idx)
+{
+	static int cached_fds[NR_GW_WORKER_THREAD][SD_MAX_NODES];
+	static uint32_t cached_epoch = 0;
+	int i, j, fd, ret;
+	char name[INET6_ADDRSTRLEN];
+
+	if (cached_epoch == 0) {
+		/* initialize */
+		for (i = 0; i < NR_GW_WORKER_THREAD; i++) {
+			for (j = 0; j < SD_MAX_NODES; j++)
+				cached_fds[i][j] = -1;
+		}
+		cached_epoch = epoch;
+	}
+
+	if (before(epoch, cached_epoch)) {
+		eprintf("requested epoch is smaller than the previous one, %d %d\n",
+			cached_epoch, epoch);
+		return -1;
+	}
+	if (after(epoch, cached_epoch)) {
+		for (i = 0; i < NR_GW_WORKER_THREAD; i++) {
+			for (j = 0; j < SD_MAX_NODES; j++) {
+				if (cached_fds[i][j] >= 0)
+					close(cached_fds[i][j]);
+
+				cached_fds[i][j] = -1;
+			}
+		}
+		cached_epoch = epoch;
+	}
+
+	fd = cached_fds[worker_idx][node_idx];
+	dprintf("%d, %d\n", epoch, fd);
+
+	if (cached_epoch == epoch && fd >= 0) {
+		dprintf("use a cached fd %d\n", fd);
+		return fd;
+	}
+
+	addr_to_str(name, sizeof(name), addr, 0);
+
+	fd = connect_to(name, port);
+	if (fd < 0)
+		return -1;
+
+	ret = set_nodelay(fd);
+	if (ret) {
+		eprintf("%m\n");
+		close(fd);
+		return -1;
+	}
+
+	cached_fds[worker_idx][node_idx] = fd;
+
+	return fd;
 }

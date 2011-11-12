@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2010 Nippon Telegraph and Telephone Corporation.
+ * Copyright (C) 2009-2011 Nippon Telegraph and Telephone Corporation.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version
@@ -65,6 +65,12 @@ extern void log_write(int prio, const char *func, int line, const char *fmt, ...
 do {									\
 	log_write(LOG_INFO, __func__, __LINE__, fmt, ##args);		\
 } while (0)
+
+#define panic(fmt, args...)			\
+({						\
+	vprintf(SDOG_EMERG fmt, ##args);	\
+	abort();				\
+})
 
 /* don't use the following obsolete functions. use vprintf instead. */
 
