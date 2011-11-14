@@ -12,3 +12,7 @@ build-stamp:
 	dh build --after configure
 	touch build-stamp
 
+
+override_dh_install:
+	dh_install
+	rm -rf debian/sheepdog/etc/init.d/
