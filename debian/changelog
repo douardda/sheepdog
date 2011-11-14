@@ -1,3 +1,10 @@
+sheepdog (0.2.4-1) experimental; urgency=low
+
+  * New upstream version
+  * [e0f4d8a] Don't install init.d script
+
+ -- Guido Günther <agx@sigxcpu.org>  Mon, 14 Nov 2011 15:35:17 +0100
+
 sheepdog (0.2.0~0.git452bc6-1) unstable; urgency=low
 
   * Initial release (Closes: #606134)
