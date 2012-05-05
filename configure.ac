@@ -18,10 +18,11 @@
 # bootstrap / init
 AC_PREREQ([2.61])
 
-m4_define([sheepdog_version], [0.2.4])
+m4_define([sheepdog_version], [0.3.0])
 
 m4_define([git_version],
-	m4_esyscmd_s([git describe --tags --dirty 2> /dev/null | sed 's/^v//']))
+	m4_esyscmd([git describe --tags --dirty 2> /dev/null | sed 's/^v//' \
+| tr '-' '_' | tr -d '\n']))
 
 AC_INIT([sheepdog], m4_default(git_version, sheepdog_version),
 	[sheepdog@lists.wpkg.org])
@@ -29,10 +30,13 @@ AM_INIT_AUTOMAKE([-Wno-portability])
 
 AC_CONFIG_SRCDIR([collie/collie.c])
 AC_CONFIG_HEADER([include/config.h])
+AC_CONFIG_TESTDIR([tests])
 
 AC_CANONICAL_HOST
 
 AC_LANG([C])
+
+AM_SILENT_RULES([yes])
 
 dnl Fix default variables - "prefix" variable if not specified
 if test "$prefix" = "NONE"; then
@@ -62,11 +66,14 @@ if ! ${MAKE-make} --version /cannot/make/this >/dev/null 2>&1; then
 fi
 
 AC_PROG_CC
+AM_PROG_AS
 AC_PROG_INSTALL
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
 AC_PROG_RANLIB
 AC_CHECK_PROGS([GROFF], [groff])
+
+AM_MISSING_PROG(AUTOM4TE, autom4te, $missing_dir)
 
 # Checks for libraries.
 AC_CHECK_LIB([socket], [socket])
@@ -121,7 +128,8 @@ AC_CONFIG_FILES([Makefile
 		include/Makefile
 		script/Makefile
 		lib/Makefile
-		man/Makefile])
+		man/Makefile
+		tests/Makefile])
 
 ### Local business
 
@@ -163,17 +171,42 @@ AC_ARG_ENABLE([fatal-warnings],
 	[ default="no" ])
 
 AC_ARG_ENABLE([debug],
-	[ --enable-debug          : enable debug build. ],
+	[  --enable-debug          : enable debug build. ],
 	[ default="no" ])
 
 AC_ARG_ENABLE([coverage],
 	[  --enable-coverage       : coverage analysis of the codebase. ],
 	[ default="no" ])
 
+AC_ARG_ENABLE([corosync],
+	[  --enable-corosync       : build corosync cluster driver ],,
+	[ enable_corosync="yes" ],)
+AM_CONDITIONAL(BUILD_COROSYNC, test x$enable_corosync = xyes)
+
+AC_ARG_ENABLE([zookeeper],
+	[  --enable-zookeeper      : build zookeeper cluster driver ],,
+	[ enable_zookeeper="no" ],)
+AM_CONDITIONAL(BUILD_ZOOKEEPER, test x$enable_zookeeper = xyes)
+
+AC_ARG_ENABLE([accord],
+	[  --enable-accord         : build accord cluster driver ],,
+	[ enable_accord="no" ],)
+AM_CONDITIONAL(BUILD_ACCORD, test x$enable_accord = xyes)
+
 AC_ARG_WITH([initddir],
 	[  --with-initddir=DIR     : path to init script directory. ],
 	[ INITDDIR="$withval" ],
 	[ INITDDIR="$sysconfdir/init.d" ])
+
+AC_ARG_ENABLE([farm],
+	[  --enable-farm           : build farm store driver ],,
+	[ enable_farm="yes" ],)
+AM_CONDITIONAL(BUILD_FARM, test x$enable_farm = xyes)
+
+AC_ARG_ENABLE([trace],
+	[  --enable-trace           : enable trace],,
+	[ enable_trace="no" ],)
+AM_CONDITIONAL(BUILD_TRACE, test x$enable_trace = xyes)
 
 CP=cp
 OS_LDL="-ldl"
@@ -213,9 +246,44 @@ else
 	GDB_FLAGS="-g"
 fi
 
-PKG_CHECK_MODULES([corosync],[corosync])
-PKG_CHECK_MODULES([libcpg],[libcpg])
-PKG_CHECK_MODULES([libcfg],[libcfg])
+if test "x${enable_corosync}" = xyes; then
+	PKG_CHECK_MODULES([corosync],[corosync])
+	PKG_CHECK_MODULES([libcpg],[libcpg])
+	PKG_CHECK_MODULES([libcfg],[libcfg])
+	AC_DEFINE_UNQUOTED([HAVE_COROSYNC], 1, [have corosync])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES corosync"
+fi
+
+if test "x${enable_zookeeper}" = xyes; then
+	AC_CHECK_LIB([zookeeper_mt], [zookeeper_init],,
+		AC_MSG_ERROR(libzookeeper not found))
+	AC_CHECK_HEADERS([zookeeper/zookeeper.h],,
+		AC_MSG_ERROR(zookeeper.h header missing))
+	AC_DEFINE_UNQUOTED([HAVE_ZOOKEEPER], 1, [have zookeeper])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES zookeeper"
+fi
+
+if test "x${enable_accord}" = xyes; then
+	PKG_CHECK_MODULES([libacrd],[libacrd])
+	AC_DEFINE_UNQUOTED([HAVE_ACCORD], 1, [have accord])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES accord"
+fi
+
+if test "x${enable_farm}" = xyes; then
+	AC_CHECK_LIB([crypto], [SHA1_Init],,
+		AC_MSG_ERROR(libcrypto not found))
+	AC_CHECK_HEADERS([openssl/sha.h],,
+		AC_MSG_ERROR(sha.h header missing))
+	AC_DEFINE_UNQUOTED([HAVE_FARM], 1, [have farm])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES farm"
+fi
+
+if test "x${enable_trace}" = xyes; then
+	AC_CHECK_LIB([rt], [clock_gettime],,
+		AC_MSG_ERROR(librt not found))
+	AC_DEFINE_UNQUOTED([HAVE_TRACE], 1, [have trace])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES trace"
+fi
 
 # extra warnings
 EXTRA_WARNINGS=""
@@ -270,11 +338,23 @@ else
 	WERROR_CFLAGS=""
 fi
 
+if test "x${enable_trace}" = xyes && \
+		cc_supports_flag -pg && \
+		cc_supports_flag -gstabs ; then
+	AC_MSG_NOTICE([Enabling trace (-pg -gstabs)])
+	TRACE_CFLAGS="-pg -gstabs -DENABLE_TRACE"
+	TRACE_LDFLAGS="-T$(pwd)/sheep/trace/trace.ld"
+	PACKAGE_FEATURES="$PACKAGE_FEATURES trace"
+else
+	TRACE_CFLAGS=""
+fi
+
 # final build of *FLAGS
 CFLAGS="$ENV_CFLAGS $OPT_CFLAGS $GDB_FLAGS $OS_CFLAGS \
-	$COVERAGE_CFLAGS $EXTRA_WARNINGS $WERROR_CFLAGS $NSS_CFLAGS -D_GNU_SOURCE"
+	$TRACE_CFLAGS $COVERAGE_CFLAGS $EXTRA_WARNINGS $WERROR_CFLAGS $NSS_CFLAGS \
+	-D_GNU_SOURCE"
 CPPFLAGS="$ENV_CPPFLAGS $ANSI_CPPFLAGS $OS_CPPFLAGS"
-LDFLAGS="$ENV_LDFLAGS $COVERAGE_LDFLAGS $OS_LDFLAGS"
+LDFLAGS="$ENV_LDFLAGS $COVERAGE_LDFLAGS $OS_LDFLAGS $TRACE_LDFLAGS"
 
 # substitute what we need:
 AC_SUBST([OS_DYFLAGS])
@@ -328,6 +408,7 @@ AC_MSG_RESULT([  ANSI defined CPPFLAGS    = ${ANSI_CPPFLAGS}])
 AC_MSG_RESULT([  Coverage     CFLAGS      = ${COVERAGE_CFLAGS}])
 AC_MSG_RESULT([  Coverage     LDFLAGS     = ${COVERAGE_LDFLAGS}])
 AC_MSG_RESULT([  Fatal War.   CFLAGS      = ${WERROR_CFLAGS}])
+AC_MSG_RESULT([  Trace        CFLAGS      = ${TRACE_CFLAGS}])
 AC_MSG_RESULT([  Final        CFLAGS      = ${CFLAGS}])
 AC_MSG_RESULT([  Final        CPPFLAGS    = ${CPPFLAGS}])
 AC_MSG_RESULT([  Final        LDFLAGS     = ${LDFLAGS}])

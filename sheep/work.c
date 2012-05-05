@@ -32,38 +32,12 @@
 #include "event.h"
 
 static int efd;
-static LIST_HEAD(worker_info_list);
-
-struct work_queue {
-	int wq_state;
-	int nr_active;
-	struct list_head pending_list;
-	struct list_head blocked_list;
-};
+int total_nr_workers;
+LIST_HEAD(worker_info_list);
 
 enum wq_state {
 	WQ_BLOCKED = (1U << 0),
 	WQ_DEAD = (1U << 1),
-};
-
-struct worker_info {
-	struct list_head worker_info_siblings;
-
-	int nr_threads;
-
-	pthread_mutex_t finished_lock;
-	struct list_head finished_list;
-
-	/* wokers sleep on this and signaled by tgtd */
-	pthread_cond_t pending_cond;
-	/* locked by tgtd and workers */
-	pthread_mutex_t pending_lock;
-	/* protected by pending_lock */
-	struct work_queue q;
-
-	pthread_mutex_t startup_lock;
-
-	pthread_t worker_thread[0];
 };
 
 static void work_queue_set_blocked(struct work_queue *q)
@@ -182,7 +156,7 @@ static void bs_thread_request_done(int fd, int events, void *data)
 			 * save its attr for qork_post_done().
 			 */
 			attr = work->attr;
-			work->done(work, 0);
+			work->done(work);
 			work_post_done(&wi->q, attr);
 		}
 	}
@@ -192,18 +166,10 @@ static void *worker_routine(void *arg)
 {
 	struct worker_info *wi = arg;
 	struct work *work;
-	int i, idx = 0;
 	eventfd_t value = 1;
 
-	for (i = 0; i < wi->nr_threads; i++) {
-		if (wi->worker_thread[i] == pthread_self()) {
-			idx = i;
-			break;
-		}
-	}
-
 	pthread_mutex_lock(&wi->startup_lock);
-	dprintf("started this thread %d\n", idx);
+	/* started this thread */
 	pthread_mutex_unlock(&wi->startup_lock);
 
 	while (!(wi->q.wq_state & WQ_DEAD)) {
@@ -225,7 +191,7 @@ retest:
 		list_del(&work->w_list);
 		pthread_mutex_unlock(&wi->pending_lock);
 
-		work->fn(work, idx);
+		work->fn(work);
 
 		pthread_mutex_lock(&wi->finished_lock);
 		list_add_tail(&work->w_list, &wi->finished_list);
@@ -247,11 +213,16 @@ static int init_eventfd(void)
 
 	efd = eventfd(0, EFD_NONBLOCK);
 	if (efd < 0) {
-		eprintf("failed to create an event fd, %m\n");
+		eprintf("failed to create an event fd: %m\n");
 		return 1;
 	}
 
 	ret = register_event(efd, bs_thread_request_done, NULL);
+	if (ret) {
+		eprintf("failed to register event fd %m\n");
+		close(efd);
+		return 1;
+	}
 
 	return 0;
 }
@@ -287,7 +258,7 @@ struct work_queue *init_work_queue(int nr)
 				     worker_routine, wi);
 
 		if (ret) {
-			eprintf("failed to create a worker thread, %d %s\n",
+			eprintf("failed to create worker thread #%d: %s\n",
 				i, strerror(ret));
 			if (ret)
 				goto destroy_threads;
@@ -297,6 +268,7 @@ struct work_queue *init_work_queue(int nr)
 
 	list_add(&wi->worker_info_siblings, &worker_info_list);
 
+	total_nr_workers += nr;
 	return &wi->q;
 destroy_threads:
 
@@ -304,7 +276,7 @@ destroy_threads:
 	pthread_mutex_unlock(&wi->startup_lock);
 	for (; i > 0; i--) {
 		pthread_join(wi->worker_thread[i - 1], NULL);
-		eprintf("stopped the worker thread %d\n", i - 1);
+		eprintf("stopped worker thread #%d\n", i - 1);
 	}
 
 /* destroy_cond_mutex: */

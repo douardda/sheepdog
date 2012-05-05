@@ -46,29 +46,33 @@ struct logarea {
 	int fd;
 };
 
-extern int log_init(char * progname, int size, int daemon, int level, char *outfile);
-extern void log_close (void);
-extern void dump_logmsg (void *);
+extern int log_init(char *progname, int size, int to_stdout, int level,
+		char *outfile);
+extern void log_close(void);
+extern void dump_logmsg(void *);
 extern void log_write(int prio, const char *func, int line, const char *fmt, ...)
 	__attribute__ ((format (printf, 4, 5)));
 
-#define	SDOG_EMERG	"<0>"
-#define	SDOG_ALERT	"<1>"
-#define	SDOG_CRIT	"<2>"
-#define	SDOG_ERR	"<3>"
-#define	SDOG_WARNING	"<4>"
-#define	SDOG_NOTICE	"<5>"
-#define	SDOG_INFO	"<6>"
-#define	SDOG_DEBUG	"<7>"
+/*
++ * sheep log priorities, comliant with syslog spec
++ */
+#define	SDOG_EMERG		LOG_EMERG
+#define	SDOG_ALERT		LOG_ALERT
+#define	SDOG_CRIT		LOG_CRIT
+#define	SDOG_ERR		LOG_ERR
+#define	SDOG_WARNING	LOG_WARNING
+#define	SDOG_NOTICE		LOG_NOTICE
+#define	SDOG_INFO		LOG_INFO
+#define	SDOG_DEBUG		LOG_DEBUG
 
-#define vprintf(fmt, args...)						\
+#define vprintf(level, fmt, args...)						\
 do {									\
-	log_write(LOG_INFO, __func__, __LINE__, fmt, ##args);		\
+	log_write(level, __func__, __LINE__, fmt, ##args);		\
 } while (0)
 
 #define panic(fmt, args...)			\
 ({						\
-	vprintf(SDOG_EMERG fmt, ##args);	\
+	vprintf(SDOG_EMERG, "PANIC: " fmt, ##args);	\
 	abort();				\
 })
 

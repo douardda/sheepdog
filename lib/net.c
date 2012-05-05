@@ -31,12 +31,30 @@
 
 int conn_tx_off(struct connection *conn)
 {
-	return modify_event(conn->fd, EPOLLIN);
+	conn->events &= ~EPOLLOUT;
+
+	return modify_event(conn->fd, conn->events);
 }
 
 int conn_tx_on(struct connection *conn)
 {
-	return modify_event(conn->fd, EPOLLIN|EPOLLOUT);
+	conn->events |= EPOLLOUT;
+
+	return modify_event(conn->fd, conn->events);
+}
+
+int conn_rx_off(struct connection *conn)
+{
+	conn->events &= ~EPOLLIN;
+
+	return modify_event(conn->fd, conn->events);
+}
+
+int conn_rx_on(struct connection *conn)
+{
+	conn->events |= EPOLLIN;
+
+	return modify_event(conn->fd, conn->events);
 }
 
 int is_conn_dead(struct connection *conn)
@@ -52,7 +70,12 @@ int rx(struct connection *conn, enum conn_state next_state)
 	int ret;
 
 	ret = read(conn->fd, conn->rx_buf, conn->rx_length);
-	if (!ret || ret < 0) {
+	if (!ret) {
+		conn->c_rx_state = C_IO_CLOSED;
+		return 0;
+	}
+
+	if (ret < 0) {
 		if (errno != EAGAIN)
 			conn->c_rx_state = C_IO_CLOSED;
 		return 0;
@@ -103,7 +126,7 @@ int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
 
 	ret = getaddrinfo(NULL, servname, &hints, &res0);
 	if (ret) {
-		eprintf("unable to get address info, %m\n");
+		eprintf("failed to get address info: %m\n");
 		return 1;
 	}
 
@@ -116,7 +139,7 @@ int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
 		ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt,
 				 sizeof(opt));
 		if (ret)
-			eprintf("can't set SO_REUSEADDR, %m\n");
+			eprintf("failed to set SO_REUSEADDR: %m\n");
 
 		opt = 1;
 		if (res->ai_family == AF_INET6) {
@@ -130,14 +153,14 @@ int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
 
 		ret = bind(fd, res->ai_addr, res->ai_addrlen);
 		if (ret) {
-			fprintf(stderr, "can't bind server socket, %m\n");
+			eprintf("failed to bind server socket: %m\n");
 			close(fd);
 			continue;
 		}
 
 		ret = listen(fd, SOMAXCONN);
 		if (ret) {
-			eprintf("can't listen to server socket, %m\n");
+			eprintf("failed to listen on server socket: %m\n");
 			close(fd);
 			continue;
 		}
@@ -160,7 +183,7 @@ int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
 	freeaddrinfo(res0);
 
 	if (!success)
-		eprintf("can't create a listen fd\n");
+		eprintf("failed to create a listening port\n");
 
 	return !success;
 }
@@ -180,7 +203,7 @@ int connect_to(const char *name, int port)
 
 	ret = getaddrinfo(name, buf, &hints, &res0);
 	if (ret) {
-		fprintf(stderr, "unable to get address info, %m\n");
+		eprintf("failed to get address info: %m\n");
 		return -1;
 	}
 
@@ -198,15 +221,15 @@ int connect_to(const char *name, int port)
 		ret = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger_opt,
 				 sizeof(linger_opt));
 		if (ret) {
-			eprintf("can't set SO_LINGER, %m\n");
+			eprintf("failed to set SO_LINGER: %m\n");
 			close(fd);
 			continue;
 		}
 
 		ret = connect(fd, res->ai_addr, res->ai_addrlen);
 		if (ret)
-			fprintf(stderr, "failed to connect to %s:%d, %s\n",
-				name, port, strerror(errno));
+			eprintf("failed to connect to %s:%d: %m\n",
+				name, port);
 		else
 			goto success;
 
@@ -224,9 +247,9 @@ int do_read(int sockfd, void *buf, int len)
 reread:
 	ret = read(sockfd, buf, len);
 	if (ret < 0 || !ret) {
-		if (errno == EINTR || errno == EAGAIN)
+		if (errno == EINTR)
 			goto reread;
-		fprintf(stderr, "failed to send a req, %m\n");
+		eprintf("failed to read from socket: %m\n");
 		return 1;
 	}
 
@@ -257,9 +280,9 @@ static int do_write(int sockfd, struct msghdr *msg, int len)
 rewrite:
 	ret = sendmsg(sockfd, msg, 0);
 	if (ret < 0) {
-		if (errno == EINTR || errno == EAGAIN)
+		if (errno == EINTR)
 			goto rewrite;
-		fprintf(stderr, "failed to send a req, %m\n");
+		eprintf("failed to write to socket: %m\n");
 		return 1;
 	}
 
@@ -294,7 +317,7 @@ int send_req(int sockfd, struct sd_req *hdr, void *data, unsigned int *wlen)
 
 	ret = do_write(sockfd, &msg, sizeof(*hdr) + *wlen);
 	if (ret) {
-		eprintf("failed to send a req, %x %d, %m\n", hdr->opcode,
+		eprintf("failed to send request %x, %d: %m\n", hdr->opcode,
 			*wlen);
 		ret = -1;
 	}
@@ -308,15 +331,12 @@ int exec_req(int sockfd, struct sd_req *hdr, void *data,
 	int ret;
 	struct sd_rsp *rsp = (struct sd_rsp *)hdr;
 
-	ret = send_req(sockfd, hdr, data, wlen);
-	if (ret) {
-		fprintf(stderr, "failed to send a req, %m\n");
+	if (send_req(sockfd, hdr, data, wlen))
 		return 1;
-	}
 
 	ret = do_read(sockfd, rsp, sizeof(*rsp));
 	if (ret) {
-		fprintf(stderr, "failed to get a rsp, %m\n");
+		eprintf("failed to read a response: %m\n");
 		return 1;
 	}
 
@@ -326,7 +346,7 @@ int exec_req(int sockfd, struct sd_req *hdr, void *data,
 	if (*rlen) {
 		ret = do_read(sockfd, data, *rlen);
 		if (ret) {
-			fprintf(stderr, "failed to get the data, %m\n");
+			eprintf("failed to read the response data: %m\n");
 			return 1;
 		}
 	}
@@ -357,18 +377,32 @@ char *addr_to_str(char *str, int size, uint8_t *addr, uint16_t port)
 	return str;
 }
 
+uint8_t *str_to_addr(int af, const char *ipstr, uint8_t *addr)
+{
+	int addr_start_idx = 0;
+
+	if (af == AF_INET)
+		addr_start_idx = 12;
+
+	memset(addr, 0, addr_start_idx);
+	if (!inet_pton(af, ipstr, addr + addr_start_idx))
+		return NULL;
+
+	return addr;
+}
+
 int set_nonblocking(int fd)
 {
 	int ret;
 
 	ret = fcntl(fd, F_GETFL);
 	if (ret < 0) {
-		eprintf("can't fcntl (F_GETFL), %m\n");
+		eprintf("fcntl F_GETFL failed: %m\n");
 		close(fd);
 	} else {
 		ret = fcntl(fd, F_SETFL, ret | O_NONBLOCK);
 		if (ret < 0)
-			eprintf("can't fcntl (O_NONBLOCK), %m\n");
+			eprintf("fcntl O_NONBLOCK failed: %m\n");
 	}
 
 	return ret;
@@ -381,4 +415,27 @@ int set_nodelay(int fd)
 	opt = 1;
 	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 	return ret;
+}
+
+int set_timeout(int fd)
+{
+	int ret;
+	const struct timeval tv = {
+		.tv_sec = DEFAULT_SOCKET_TIMEOUT,
+		.tv_usec = 0,
+	};
+
+	ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	if (ret) {
+		eprintf("failed to set send timeout\n");
+		return ret;
+	}
+
+	ret = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	if (ret) {
+		eprintf("failed to set recv timeout\n");
+		return ret;
+	}
+
+	return 0;
 }

@@ -53,9 +53,9 @@ extern int sdport;
 extern int highlight;
 extern int raw_output;
 
-extern uint64_t node_list_version;
-extern struct sheepdog_node_list_entry node_list_entries[SD_MAX_NODES];
-extern struct sheepdog_vnode_list_entry vnode_list_entries[SD_MAX_VNODES];
+extern uint32_t node_list_version;
+extern struct sd_node node_list_entries[SD_MAX_NODES];
+extern struct sd_vnode vnode_list_entries[SD_MAX_VNODES];
 extern int nr_nodes, nr_vnodes;
 extern unsigned master_idx;
 
@@ -73,5 +73,11 @@ int sd_write_object(uint64_t oid, uint64_t cow_oid, void *data, unsigned int dat
 extern struct command vdi_command;
 extern struct command node_command;
 extern struct command cluster_command;
+
+#ifdef ENABLE_TRACE
+  extern struct command debug_command;
+#else
+  #define debug_command {}
+#endif /* ENABLE_TRACE */
 
 #endif

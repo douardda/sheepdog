@@ -19,16 +19,39 @@ MAINTAINERCLEANFILES	= Makefile.in
 
 AM_CFLAGS		=
 
-INCLUDES		= -I$(top_builddir)/include -I$(top_srcdir)/include $(libcpg_CFLAGS) $(libcfg_CFLAGS)
+INCLUDES		= -I$(top_builddir)/include -I$(top_srcdir)/include \
+			  $(libcpg_CFLAGS) $(libcfg_CFLAGS) $(libacrd_CFLAGS)
 
 sbin_PROGRAMS		= sheep
 
-sheep_SOURCES		= sheep.c group.c sdnet.c store.c vdi.c work.c
-sheep_LDADD	  	= $(libcpg_LIBS) $(libcfg_LIBS) ../lib/libsheepdog.a -lpthread
+sheep_SOURCES		= sheep.c group.c sdnet.c store.c vdi.c work.c \
+			  journal.c ops.c recovery.c cluster/local.c strbuf.c \
+			  simple_store.c object_cache.c object_list_cache.c
+
+if BUILD_COROSYNC
+sheep_SOURCES		+= cluster/corosync.c
+endif
+if BUILD_ZOOKEEPER
+sheep_SOURCES		+= cluster/zookeeper.c
+endif
+if BUILD_ACCORD
+sheep_SOURCES		+= cluster/accord.c
+endif
+
+if BUILD_FARM
+sheep_SOURCES		+= farm/sha1_file.c farm/trunk.c farm/snap.c farm/farm.c
+endif
+
+if BUILD_TRACE
+sheep_SOURCES		+= trace/trace.c trace/mcount.S trace/stabs.c trace/graph.c
+endif
+
+sheep_LDADD	  	= ../lib/libsheepdog.a -lpthread \
+			  $(libcpg_LIBS) $(libcfg_LIBS) $(libacrd_LIBS) $(LIBS)
 sheep_DEPENDENCIES	= ../lib/libsheepdog.a
 
 
-noinst_HEADERS		= work.h sheep_priv.h
+noinst_HEADERS		= work.h sheep_priv.h cluster.h strbuf.h farm/farm.h trace/trace.h
 
 EXTRA_DIST		= 
 

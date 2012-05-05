@@ -28,8 +28,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <pthread.h>
 
 #include "logger.h"
+#include "util.h"
 
 #define LOGDBG 0
 
@@ -46,25 +48,31 @@ static void dolog(int prio, const char *func, int line, const char *fmt,
 
 static struct logarea *la;
 static char *log_name;
-static int log_level = LOG_INFO;
-static pid_t pid;
+static char *log_nowname;
+static int log_level = SDOG_INFO;
+static pid_t sheep_pid;
+static pid_t logger_pid;
 static key_t semkey;
 
-static int logarea_init (int size)
+static int64_t max_logsize = 500 * 1024 * 1024;  /*500MB*/
+
+pthread_mutex_t logsize_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static notrace int logarea_init(int size)
 {
 	int shmid;
 
-	logdbg(stderr,"enter logarea_init\n");
+	logdbg(stderr, "entering logarea_init\n");
 
 	if ((shmid = shmget(IPC_PRIVATE, sizeof(struct logarea),
 			    0644 | IPC_CREAT | IPC_EXCL)) == -1) {
-		syslog(LOG_ERR, "shmget logarea failed %d", errno);
+		syslog(LOG_ERR, "shmget logarea failed: %m");
 		return 1;
 	}
 
 	la = shmat(shmid, NULL, 0);
 	if (!la) {
-		syslog(LOG_ERR, "shmat logarea failed %d", errno);
+		syslog(LOG_ERR, "shmat logarea failed: %m");
 		return 1;
 	}
 
@@ -75,14 +83,14 @@ static int logarea_init (int size)
 
 	if ((shmid = shmget(IPC_PRIVATE, size,
 			    0644 | IPC_CREAT | IPC_EXCL)) == -1) {
-		syslog(LOG_ERR, "shmget msg failed %d", errno);
+		syslog(LOG_ERR, "shmget msg failed: %m");
 		shmdt(la);
 		return 1;
 	}
 
 	la->start = shmat(shmid, NULL, 0);
 	if (!la->start) {
-		syslog(LOG_ERR, "shmat msg failed %d", errno);
+		syslog(LOG_ERR, "shmat msg failed: %m");
 		shmdt(la);
 		return 1;
 	}
@@ -97,14 +105,14 @@ static int logarea_init (int size)
 
 	if ((shmid = shmget(IPC_PRIVATE, MAX_MSG_SIZE + sizeof(struct logmsg),
 			    0644 | IPC_CREAT | IPC_EXCL)) == -1) {
-		syslog(LOG_ERR, "shmget logmsg failed %d", errno);
+		syslog(LOG_ERR, "shmget logmsg failed: %m");
 		shmdt(la->start);
 		shmdt(la);
 		return 1;
 	}
 	la->buff = shmat(shmid, NULL, 0);
 	if (!la->buff) {
-		syslog(LOG_ERR, "shmat logmsgfailed %d", errno);
+		syslog(LOG_ERR, "shmat logmsg failed: %m");
 		shmdt(la->start);
 		shmdt(la);
 		return 1;
@@ -113,7 +121,7 @@ static int logarea_init (int size)
 	shmctl(shmid, IPC_RMID, NULL);
 
 	if ((la->semid = semget(semkey, 1, 0666 | IPC_CREAT)) < 0) {
-		syslog(LOG_ERR, "semget failed %d", errno);
+		syslog(LOG_ERR, "semget failed: %m");
 		shmdt(la->buff);
 		shmdt(la->start);
 		shmdt(la);
@@ -122,7 +130,7 @@ static int logarea_init (int size)
 
 	la->semarg.val=1;
 	if (semctl(la->semid, 0, SETVAL, la->semarg) < 0) {
-		syslog(LOG_ERR, "semctl failed %d", errno);
+		syslog(LOG_ERR, "semctl failed: %m");
 		shmdt(la->buff);
 		shmdt(la->start);
 		shmdt(la);
@@ -132,7 +140,7 @@ static int logarea_init (int size)
 	return 0;
 }
 
-static void free_logarea (void)
+static void notrace free_logarea(void)
 {
 	if (la->fd >= 0)
 		close(la->fd);
@@ -143,7 +151,7 @@ static void free_logarea (void)
 }
 
 #if LOGDBG
-static void dump_logarea (void)
+static void dump_logarea(void)
 {
 	struct logmsg * msg;
 
@@ -163,7 +171,7 @@ static void dump_logarea (void)
 }
 #endif
 
-static int log_enqueue(int prio, const char *func, int line, const char *fmt,
+static notrace int log_enqueue(int prio, const char *func, int line, const char *fmt,
 		       va_list ap)
 {
 	int len, fwd;
@@ -188,7 +196,7 @@ static int log_enqueue(int prio, const char *func, int line, const char *fmt,
 		t = time(NULL);
 		tmp = localtime(&t);
 
-		strftime(p, MAX_MSG_SIZE, "%b %2d %I:%M:%S ", tmp);
+		strftime(p, MAX_MSG_SIZE, "%b %2d %H:%M:%S ", tmp);
 		p += strlen(p);
 	}
 
@@ -197,11 +205,6 @@ static int log_enqueue(int prio, const char *func, int line, const char *fmt,
 	p += strlen(p);
 
 	vsnprintf(p, MAX_MSG_SIZE - strlen(p), fmt, ap);
-
-	if (p[0] == '<' && p[2] == '>') {
-		prio = atoi(p + 1);
-		memmove(p, p + 3, strlen(p) - 3 + 1);
-	}
 
 	len = strlen(buff) * sizeof(char) + 1;
 
@@ -215,7 +218,7 @@ static int log_enqueue(int prio, const char *func, int line, const char *fmt,
 	/* not enough space on head : drop msg */
 	if (la->head > la->tail &&
 	    (len + sizeof(struct logmsg)) > ((char *)la->head - (char *)la->tail)) {
-		logdbg(stderr, "enqueue: log area overrun, drop msg\n");
+		logdbg(stderr, "enqueue: log area overrun, dropping message\n");
 
 		if (!la->empty)
 			la->tail = lastmsg;
@@ -240,7 +243,7 @@ static int log_enqueue(int prio, const char *func, int line, const char *fmt,
 	return 0;
 }
 
-static int log_dequeue(void *buff)
+static notrace int log_dequeue(void *buff)
 {
 	struct logmsg * src = (struct logmsg *)la->head;
 	struct logmsg * dst = (struct logmsg *)buff;
@@ -273,30 +276,27 @@ static int log_dequeue(void *buff)
 /*
  * this one can block under memory pressure
  */
-static void log_syslog (void * buff)
+static notrace void log_syslog(void *buff)
 {
 	struct logmsg * msg = (struct logmsg *)buff;
 
 	if (la->fd >= 0)
-		write(la->fd, (char *)&msg->str, strlen((char *)&msg->str));
+		xwrite(la->fd, (char *)&msg->str, strlen((char *)&msg->str));
 	else
 		syslog(msg->prio, "%s", (char *)&msg->str);
 }
 
-static void dolog(int prio, const char *func, int line, const char *fmt, va_list ap)
+static notrace void dolog(int prio, const char *func, int line,
+		const char *fmt, va_list ap)
 {
-	struct timespec ts;
-	struct sembuf ops;
-
 	if (la) {
-		ts.tv_sec = 0;
-		ts.tv_nsec = 10000;
+		struct sembuf ops;
 
 		ops.sem_num = 0;
 		ops.sem_flg = SEM_UNDO;
 		ops.sem_op = -1;
 		if (semop(la->semid, &ops, 1) < 0) {
-			syslog(LOG_ERR, "semop up failed %m");
+			syslog(LOG_ERR, "semop up failed: %m");
 			return;
 		}
 
@@ -304,22 +304,13 @@ static void dolog(int prio, const char *func, int line, const char *fmt, va_list
 
 		ops.sem_op = 1;
 		if (semop(la->semid, &ops, 1) < 0) {
-			syslog(LOG_ERR, "semop down failed");
+			syslog(LOG_ERR, "semop down failed: %m");
 			return;
 		}
 	} else {
-		char *p, q[MAX_MSG_SIZE];
+		char p[MAX_MSG_SIZE];
 
-		p = q;
 		vsnprintf(p, MAX_MSG_SIZE, fmt, ap);
-
-		if (p[0] == '<' && p[2] == '>') {
-			prio = atoi(p + 1);
-			p += 3;
-		}
-
-		if (prio > log_level)
-			return;
 
 		if (log_name)
 			fprintf(stderr, "%s: %s(%d) %s", log_name, func, line, p);
@@ -330,15 +321,42 @@ static void dolog(int prio, const char *func, int line, const char *fmt, va_list
 	}
 }
 
-void log_write(int prio, const char *func, int line, const char *fmt, ...)
+static notrace void rotate_log(void)
+{
+	int new_fd;
+
+	if (access(log_nowname, R_OK) == 0) {
+		char old_logfile[256];
+		time_t t;
+		struct tm tm;
+		time(&t);
+		localtime_r((const time_t *)&t, &tm);
+		sprintf(old_logfile, "%s.%04d-%02d-%02d-%02d-%02d",
+				log_nowname, tm.tm_year + 1900, tm.tm_mon + 1,
+				tm.tm_mday, tm.tm_hour, tm.tm_min);
+		rename(log_nowname, old_logfile);
+	}
+	new_fd = open(log_nowname, O_RDWR | O_CREAT | O_APPEND, 0644);
+	if (new_fd < 0)
+		syslog(LOG_ERR, "fail to create new log file\n");
+
+	dup2(new_fd, la->fd);
+	la->fd = new_fd;
+}
+
+notrace void log_write(int prio, const char *func, int line, const char *fmt, ...)
 {
 	va_list ap;
+
+	if (prio > log_level)
+		return;
+
 	va_start(ap, fmt);
 	dolog(prio, func, line, fmt, ap);
 	va_end(ap);
 }
 
-static void log_flush(void)
+static notrace void log_flush(void)
 {
 	struct sembuf ops;
 
@@ -347,7 +365,7 @@ static void log_flush(void)
 		ops.sem_flg = SEM_UNDO;
 		ops.sem_op = -1;
 		if (semop(la->semid, &ops, 1) < 0) {
-			syslog(LOG_ERR, "semop up failed");
+			syslog(LOG_ERR, "semop up failed: %m");
 			exit(1);
 		}
 
@@ -355,32 +373,47 @@ static void log_flush(void)
 
 		ops.sem_op = 1;
 		if (semop(la->semid, &ops, 1) < 0) {
-			syslog(LOG_ERR, "semop down failed");
+			syslog(LOG_ERR, "semop down failed: %m");
 			exit(1);
 		}
 		log_syslog(la->buff);
 	}
 }
 
-static void log_sigsegv(void)
+static notrace void crash_handler(int signo)
 {
-	vprintf(SDOG_ERR "sheep logger exits abnormally, pid:%d\n", getpid());
+	if (signo == SIGSEGV) {
+		vprintf(SDOG_ERR, "logger pid %d segfaulted.\n",
+			getpid());
+	} else if (signo == SIGHUP) {
+		vprintf(SDOG_ERR, "sheep pid %d exited unexpectedly.\n",
+			sheep_pid);
+	} else {
+		vprintf(SDOG_ERR, "logger pid %d got unexpected signal %d.\n",
+			getpid(), signo);
+	}
+
 	log_flush();
 	closelog();
 	free_logarea();
 	exit(1);
 }
 
-int log_init(char *program_name, int size, int is_daemon, int level, char *outfile)
+notrace int log_init(char *program_name, int size, int to_stdout, int level,
+		char *outfile)
 {
+	off_t offset;
+	size_t log_size;
+
 	log_level = level;
 
-	logdbg(stderr,"enter log_init\n");
+	logdbg(stderr, "entering log_init\n");
 	log_name = program_name;
+	log_nowname = outfile;
 
 	semkey = random();
 
-	if (is_daemon) {
+	if (!to_stdout) {
 		struct sigaction sa_old;
 		struct sigaction sa_new;
 		int fd;
@@ -393,7 +426,7 @@ int log_init(char *program_name, int size, int is_daemon, int level, char *outfi
 			}
 		} else {
 			fd = -1;
-			openlog(log_name, 0, LOG_DAEMON);
+			openlog(log_name, LOG_CONS | LOG_PID, LOG_DAEMON);
 			setlogmask (LOG_UPTO (LOG_DEBUG));
 		}
 
@@ -404,20 +437,27 @@ int log_init(char *program_name, int size, int is_daemon, int level, char *outfi
 
 		la->active = 1;
 		la->fd = fd;
-		pid = fork();
-		if (pid < 0) {
-			syslog(LOG_ERR, "fail to fork the logger\n");
+
+		/*
+		 * Store the pid of the sheep process for use by the death
+		 * signal handler.  By the time the child is notified of
+		 * the parents death the parent has been reparanted to init
+		 * and getppid() will always return 1.
+		 */
+		sheep_pid = getpid();
+
+		logger_pid = fork();
+		if (logger_pid < 0) {
+			syslog(LOG_ERR, "failed to fork the logger process: %m\n");
 			return 1;
-		} else if (pid) {
-			syslog(LOG_WARNING,
-			       "Target daemon logger with pid=%d started!\n", pid);
+		} else if (logger_pid) {
+			syslog(LOG_WARNING, "logger pid %d starting\n", logger_pid);
 			return 0;
 		}
 
 		fd = open("/dev/null", O_RDWR);
 		if (fd < 0) {
-			syslog(LOG_ERR, "failed to open /dev/null: %s\n",
-			       strerror(errno));
+			syslog(LOG_ERR, "failed to open /dev/null: %m\n");
 			exit(1);
 		}
 
@@ -426,21 +466,36 @@ int log_init(char *program_name, int size, int is_daemon, int level, char *outfi
 		dup2(fd, 2);
 		setsid();
 		if (chdir("/") < 0) {
-			syslog(LOG_ERR, "failed to chdir to '/': %s\n",
-			       strerror(errno));
+			syslog(LOG_ERR, "failed to chdir to /: %m\n");
 			exit(1);
 		}
 
-		/* flush on daemon's crash */
-		sa_new.sa_handler = (void*)log_sigsegv;
-		sigemptyset(&sa_new.sa_mask);
+		/* flush when either the logger or its parent dies */
+		sa_new.sa_handler = crash_handler;
 		sa_new.sa_flags = 0;
-		sigaction(SIGSEGV, &sa_new, &sa_old );
+		sigemptyset(&sa_new.sa_mask);
 
-		prctl(PR_SET_PDEATHSIG, SIGSEGV);
+		sigaction(SIGSEGV, &sa_new, &sa_old);
+		sigaction(SIGHUP, &sa_new, &sa_old);
+
+		prctl(PR_SET_PDEATHSIG, SIGHUP);
 
 		while (la->active) {
 			log_flush();
+
+			if (max_logsize) {
+				pthread_mutex_lock(&logsize_lock);
+				offset = lseek(la->fd, 0, SEEK_END);
+				if (offset < 0) {
+					syslog(LOG_ERR, "sheep log error\n");
+				} else {
+					log_size = (size_t)offset;
+					if (log_size >= max_logsize)
+						rotate_log();
+				}
+				pthread_mutex_unlock(&logsize_lock);
+			}
+
 			sleep(1);
 		}
 
@@ -450,13 +505,13 @@ int log_init(char *program_name, int size, int is_daemon, int level, char *outfi
 	return 0;
 }
 
-void log_close(void)
+notrace void log_close(void)
 {
 	if (la) {
 		la->active = 0;
-		waitpid(pid, NULL, 0);
+		waitpid(logger_pid, NULL, 0);
 
-		vprintf(SDOG_WARNING "sheep logger stopped, pid:%d\n", pid);
+		vprintf(SDOG_WARNING, "logger pid %d stopped\n", logger_pid);
 		log_flush();
 		closelog();
 		free_logarea();

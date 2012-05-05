@@ -25,10 +25,8 @@ static int node_list(int argc, char **argv)
 {
 	int i;
 
-	if (!raw_output) {
-		printf("   Idx - Host:Port          Vnodes       Zone\n");
-		printf("---------------------------------------------\n");
-	}
+	if (!raw_output)
+		printf("M   Id   Host:Port         V-Nodes       Zone\n");
 	for (i = 0; i < nr_nodes; i++) {
 		char data[128];
 
@@ -38,13 +36,13 @@ static int node_list(int argc, char **argv)
 		if (i == master_idx) {
 			if (highlight)
 				printf(TEXT_BOLD);
-			printf(raw_output ? "* %d %s %d %d\n" : "* %4d - %-20s\t%d%11d\n",
+			printf(raw_output ? "* %d %s %d %d\n" : "* %4d   %-20s\t%2d%11d\n",
 			       i, data, node_list_entries[i].nr_vnodes,
 			       node_list_entries[i].zone);
 			if (highlight)
 				printf(TEXT_NORMAL);
 		} else
-			printf(raw_output ? "- %d %s %d %d\n" : "  %4d - %-20s\t%d%11d\n",
+			printf(raw_output ? "- %d %s %d %d\n" : "- %4d   %-20s\t%2d%11d\n",
 			       i, data, node_list_entries[i].nr_vnodes,
 			       node_list_entries[i].zone);
 	}
@@ -100,17 +98,19 @@ static int node_info(int argc, char **argv)
 	}
 
 	if (success == 0) {
-		fprintf(stderr, "cannot get information from any nodes\n");
+		fprintf(stderr, "Cannot get information from any nodes\n");
 		return EXIT_SYSFAIL;
 	}
 
-	parse_vdi(cal_total_vdi_size, SD_INODE_HEADER_SIZE, &total_vdi_size);
+	if (parse_vdi(cal_total_vdi_size, SD_INODE_HEADER_SIZE,
+			&total_vdi_size) < 0)
+		return EXIT_SYSFAIL;
 
 	size_to_str(total_size, total_str, sizeof(total_str));
 	size_to_str(total_size - total_avail, avail_str, sizeof(avail_str));
 	size_to_str(total_vdi_size, vdi_size_str, sizeof(vdi_size_str));
 	printf(raw_output ? "Total %s %s %d%% %s\n"
-			  : "\nTotal\t%s\t%s\t%3d%%, total virtual VDI Size\t%s\n",
+			  : "Total\t%s\t%s\t%3d%%\n\nTotal virtual image size\t%s\n",
 	       total_str, avail_str,
 	       (int)(((double)(total_size - total_avail) / total_size) * 100),
 	       vdi_size_str);
@@ -118,11 +118,56 @@ static int node_info(int argc, char **argv)
 	return EXIT_SUCCESS;
 }
 
+static int node_recovery(int argc, char **argv)
+{
+	int i, ret;
+
+	if (!raw_output) {
+		printf("Nodes In Recovery:\n");
+		printf("  Id   Host:Port         V-Nodes       Zone\n");
+	}
+
+	for (i = 0; i < nr_nodes; i++) {
+		char host[128];
+		int fd;
+		unsigned wlen, rlen;
+		struct sd_node_req req;
+		struct sd_node_rsp *rsp = (struct sd_node_rsp *)&req;
+
+		addr_to_str(host, sizeof(host), node_list_entries[i].addr, 0);
+
+		fd = connect_to(host, node_list_entries[i].port);
+		if (fd < 0)
+			return EXIT_FAILURE;
+
+		memset(&req, 0, sizeof(req));
+
+		req.opcode = SD_OP_STAT_RECOVERY;
+
+		wlen = 0;
+		rlen = 0;
+		ret = exec_req(fd, (struct sd_req *)&req, NULL, &wlen, &rlen);
+		close(fd);
+
+		if (!ret && rsp->result == SD_RES_SUCCESS) {
+			addr_to_str(host, sizeof(host),
+					node_list_entries[i].addr, node_list_entries[i].port);
+			printf(raw_output ? "%d %s %d %d\n" : "%4d   %-20s%5d%11d\n",
+				   i, host, node_list_entries[i].nr_vnodes,
+				   node_list_entries[i].zone);
+		}
+	}
+
+	return EXIT_SUCCESS;
+}
+
 static struct subcommand node_cmd[] = {
 	{"list", NULL, "aprh", "list nodes",
 	 SUBCMD_FLAG_NEED_NODELIST, node_list},
-	{"info", NULL, "aprh", "show each node information",
+	{"info", NULL, "aprh", "show information about each node",
 	 SUBCMD_FLAG_NEED_NODELIST, node_info},
+	{"recovery", NULL, "aprh", "show nodes in recovery",
+	 SUBCMD_FLAG_NEED_NODELIST, node_recovery},
 	{NULL,},
 };
 
