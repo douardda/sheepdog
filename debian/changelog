@@ -1,3 +1,9 @@
+sheepdog (0.3.0-1) experimental; urgency=low
+
+  * New upstream version
+
+ -- David Douard <david.douard@logilab.fr>  Mon, 07 May 2012 10:33:20 +0200
+
 sheepdog (0.2.4-1) experimental; urgency=low
 
   * New upstream version
