@@ -2,17 +2,13 @@
 # -*- makefile -*-
 
 %:
-	dh $@
-
-build: build-stamp
-build-stamp:
-	dh build --before configure
-	./autogen.sh
-	dh_auto_configure
-	dh build --after configure
-	touch build-stamp
-
+	dh $@ --with autoreconf
 
 override_dh_install:
 	dh_install
-	rm -rf debian/sheepdog/etc/init.d/
+	# Install bash autocompletion.
+	install -m 644 -D \
+		script/bash_completion_collie \
+		$(CURDIR)/debian/sheepdog/etc/bash_completion.d/collie
+
+
