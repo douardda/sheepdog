@@ -1,3 +1,9 @@
+sheepdog (0.4.0~0.git0ae0ad-1) experimental; urgency=low
+
+  * New upstream version (git 0ae0add5f17c74958a378886881425400156097d)
+
+ -- David Douard <david.douard@logilab.fr>  Thu, 07 Jun 2012 09:29:25 +0200
+
 sheepdog (0.3.0-1) experimental; urgency=low
 
   * New upstream version

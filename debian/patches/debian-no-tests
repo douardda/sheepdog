@@ -1,0 +1,19 @@
+Description: Do not run tests when buildig (they require a corosync setup)
+
+--- /dev/null
++++ sheepdog-0.4.0~0.git0ae0ad/.emacs.desktop.lock
+@@ -0,0 +1 @@
++18725
+\ No newline at end of file
+--- sheepdog-0.4.0~0.git0ae0ad.orig/Makefile.am
++++ sheepdog-0.4.0~0.git0ae0ad/Makefile.am
+@@ -17,7 +17,7 @@ sheepdogsysconfdir	= ${SHEEPDOGCONFDIR}
+ 
+ sheepdogsysconf_DATA	= 
+ 
+-SUBDIRS			= lib collie sheep include script man tests
++SUBDIRS			= lib collie sheep include script man
+ 
+ if BUILD_SHEEPFS
+ SUBDIRS			+= sheepfs
+
