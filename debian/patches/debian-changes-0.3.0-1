@@ -48,71 +48,6 @@ Last-Update: <YYYY-MM-DD>
  
  $(SPEC): $(SPEC).in
  	rm -f $@-t $@
---- /dev/null
-+++ sheepdog-0.3.0/.emacs.desktop
-@@ -0,0 +1,62 @@
-+;; -*- mode: emacs-lisp; coding: emacs-mule; -*-
-+;; --------------------------------------------------------------------------
-+;; Desktop File for Emacs
-+;; --------------------------------------------------------------------------
-+;; Created Tue May 15 01:33:47 2012
-+;; Desktop file format version 206
-+;; Emacs version 23.2.1
-+
-+;; Global section:
-+(setq desktop-missing-file-warning nil)
-+(setq tags-file-name nil)
-+(setq tags-table-list nil)
-+(setq search-ring nil)
-+(setq regexp-search-ring nil)
-+(setq register-alist nil)
-+(setq file-name-history '("~/local/debian/corosync/debian/rules" "~/local/debian/sheepdog/script/bash_completion_collie" "~/local/debian/sheepdog/script/start-sheepdog" "~/local/debian/sheepdog/debian/patches/series" "~/local/debian/sheepdog/debian/source/format" "~/local/debian/sheepdog/debian/patches/debian-changes-0.3.0-1" "~/local/debian/sheepdog/autogen.sh" "~/local/debian/sheepdog/Makefile.am" "~/local/debian/sheepdog/autogen.sh" "~/local/debian/sheepdog/debian/control" "~/local/debian/sheepdog/debian/rules"))
-+
-+;; Buffer section -- buffers listed in same order as in buffer list:
-+(desktop-create-buffer 206
-+  "/home/david/local/debian/sheepdog/debian/rules"
-+  "rules"
-+  'makefile-mode
-+  nil
-+  196
-+  '(290 nil)
-+  nil
-+  nil
-+  '((indent-tabs-mode . t) (buffer-file-coding-system . undecided-unix)))
-+
-+(desktop-create-buffer 206
-+  "/home/david/local/debian/sheepdog/debian/control"
-+  "control"
-+  'text-mode
-+  nil
-+  217
-+  '(205 nil)
-+  nil
-+  nil
-+  '((buffer-file-coding-system . utf-8-unix)))
-+
-+(desktop-create-buffer 206
-+  "/home/david/local/debian/corosync/debian/rules"
-+  "rules"
-+  'makefile-gmake-mode
-+  nil
-+  487
-+  '(408 nil)
-+  nil
-+  nil
-+  '((indent-tabs-mode . t) (buffer-file-coding-system . undecided-unix)))
-+
-+(desktop-create-buffer 206
-+  "/home/david/local/debian/sheepdog/Makefile.am"
-+  "Makefile.am"
-+  'makefile-automake-mode
-+  nil
-+  400
-+  '(nil nil)
-+  nil
-+  nil
-+  '((indent-tabs-mode . t) (buffer-file-coding-system . undecided-unix)))
-+
 --- sheepdog-0.3.0.orig/configure.ac
 +++ sheepdog-0.3.0/configure.ac
 @@ -66,7 +66,6 @@ if ! ${MAKE-make} --version /cannot/make
@@ -10391,27 +10326,6 @@ Last-Update: <YYYY-MM-DD>
 +	self->caller = NULL;
 +	coroutine_swap(self, to);
 +}
---- sheepdog-0.3.0.orig/tests/test_membership.py
-+++ sheepdog-0.3.0/tests/test_membership.py
-@@ -54,6 +54,9 @@ def test_mastership():
-         n.start()
-         n.wait()
- 
-+    # FIXME: should be smarter than this
-+    time.sleep(0.5)
-+
-     # only nodes[2] should be in the cluster
-     p = sdog.nodes[2].run_collie('node list -r')
-     (out, _) = p.communicate()
-@@ -63,6 +66,8 @@ def test_mastership():
-     sdog.nodes[0].wait()
-     sdog.nodes[1].start()
-     sdog.nodes[1].wait()
-+    # FIXME: should be smarter than this
-+    time.sleep(0.5)
- 
-     for n in sdog.nodes:
-         p = n.run_collie('node list -r')
 --- /dev/null
 +++ sheepdog-0.3.0/script/check-dog.pl
 @@ -0,0 +1,135 @@
