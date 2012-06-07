@@ -21,27 +21,38 @@
 #include <sys/syslog.h>
 
 #include "sheep_priv.h"
+#include "trace/trace.h"
 
 #define EPOLL_SIZE 4096
 #define DEFAULT_OBJECT_DIR "/tmp"
 #define LOG_FILE_NAME "sheep.log"
 
+static unsigned nr_io_worker = 4;
+static unsigned nr_gateway_worker = 4;
+
 LIST_HEAD(cluster_drivers);
 static char program_name[] = "sheep";
 
 static struct option const long_options[] = {
-	{"port", required_argument, NULL, 'p'},
-	{"foreground", no_argument, NULL, 'f'},
-	{"loglevel", required_argument, NULL, 'l'},
+	{"asyncflush", no_argument, NULL, 'a'},
+	{"cluster", required_argument, NULL, 'c'},
 	{"debug", no_argument, NULL, 'd'},
 	{"directio", no_argument, NULL, 'D'},
-	{"zone", required_argument, NULL, 'z'},
-	{"cluster", required_argument, NULL, 'c'},
+	{"foreground", no_argument, NULL, 'f'},
+	{"nr_gateway_worker", required_argument, NULL, 'g'},
+	{"gateway", no_argument, NULL, 'G'},
 	{"help", no_argument, NULL, 'h'},
+	{"nr_io_worker", required_argument, NULL, 'i'},
+	{"loglevel", required_argument, NULL, 'l'},
+	{"stdout", no_argument, NULL, 'o'},
+	{"port", required_argument, NULL, 'p'},
+	{"vnodes", required_argument, NULL, 'v'},
+	{"disable-cache", no_argument, NULL, 'W'},
+	{"zone", required_argument, NULL, 'z'},
 	{NULL, 0, NULL, 0},
 };
 
-static const char *short_options = "p:fl:dDz:c:h";
+static const char *short_options = "ac:dDfg:Ghi:l:op:v:Wz:";
 
 static void usage(int status)
 {
@@ -53,14 +64,21 @@ static void usage(int status)
 Sheepdog daemon (version %s)\n\
 Usage: %s [OPTION]... [PATH]\n\
 Options:\n\
-  -p, --port              specify the TCP port on which to listen\n\
-  -f, --foreground        make the program run in the foreground\n\
-  -l, --loglevel          specify the level of logging detail\n\
-  -d, --debug             include debug messages in the log\n\
-  -D, --directio          use direct IO when accessing the object store\n\
-  -z, --zone              specify the zone id\n\
+  -a, --asyncflush        flush the object cache asynchronously\n\
   -c, --cluster           specify the cluster driver\n\
+  -d, --debug             include debug messages in the log\n\
+  -D, --directio          use direct IO when accessing the object from object cache\n\
+  -f, --foreground        make the program run in the foreground\n\
+  -g, --nr_gateway_worker set the number of workers for Guests' requests (default 4)\n\
+  -G, --gateway           make the progam run as a gateway mode (same as '-v 0')\n\
   -h, --help              display this help and exit\n\
+  -i, --nr_io_worker      set the number of workers for sheep internal requests (default 4)\n\
+  -l, --loglevel          specify the level of logging detail\n\
+  -o, --stdout            log to stdout instead of shared logger\n\
+  -p, --port              specify the TCP port on which to listen\n\
+  -v, --vnodes            specify the number of virtual nodes\n\
+  -W, --disable-cache     disable writecache\n\
+  -z, --zone              specify the zone id\n\
 ", PACKAGE_VERSION, program_name);
 	exit(status);
 }
@@ -89,11 +107,14 @@ int main(int argc, char **argv)
 	int ret, port = SD_LISTEN_PORT;
 	const char *dir = DEFAULT_OBJECT_DIR;
 	int is_daemon = 1;
+	int to_stdout = 0;
 	int log_level = SDOG_INFO;
 	char path[PATH_MAX];
 	int64_t zone = -1;
+	int nr_vnodes = SD_DEFAULT_VNODES;
 	char *p;
 	struct cluster_driver *cdrv;
+	int enable_write_cache = 1; /* enabled by default */
 
 	signal(SIGPIPE, SIG_IGN);
 
@@ -129,6 +150,34 @@ int main(int argc, char **argv)
 			dprintf("direct IO mode\n");
 			sys->use_directio = 1;
 			break;
+		case 'a':
+			sys->async_flush = 1;
+			break;
+		case 'g':
+			nr_gateway_worker = strtol(optarg, &p, 10);
+			if (optarg == p || nr_gateway_worker < 4 || nr_gateway_worker > UINT32_MAX) {
+				fprintf(stderr, "Invalid number of gateway workers '%s': "
+					"must be an integer between 4 and %u\n",
+					optarg, UINT32_MAX);
+				exit(1);
+			}
+			break;
+		case 'G':
+			/* same as '-v 0' */
+			nr_vnodes = 0;
+			break;
+		case 'i':
+			nr_io_worker = strtol(optarg, &p, 10);
+			if (optarg == p || nr_io_worker < 4 || nr_io_worker > UINT32_MAX) {
+				fprintf(stderr, "Invalid number of internal IO workers '%s': "
+					"must be an integer between 4 and %u\n",
+					optarg, UINT32_MAX);
+				exit(1);
+			}
+			break;
+		case 'o':
+			to_stdout = 1;
+			break;
 		case 'z':
 			zone = strtol(optarg, &p, 10);
 			if (optarg == p || zone < 0 || UINT32_MAX < zone) {
@@ -138,6 +187,19 @@ int main(int argc, char **argv)
 				exit(1);
 			}
 			sys->this_node.zone = zone;
+			break;
+		case 'W':
+			vprintf(SDOG_INFO, "disable write cache\n");
+			enable_write_cache = 0;
+			break;
+		case 'v':
+			nr_vnodes = strtol(optarg, &p, 10);
+			if (optarg == p || nr_vnodes < 0 || SD_MAX_VNODES < nr_vnodes) {
+				fprintf(stderr, "Invalid number of virtual nodes '%s': "
+					"must be an integer between 0 and %u\n",
+					optarg, SD_MAX_VNODES);
+				exit(1);
+			}
 			break;
 		case 'c':
 			sys->cdrv = find_cdrv(optarg);
@@ -176,11 +238,11 @@ int main(int argc, char **argv)
 	if (ret)
 		exit(1);
 
-	ret = log_init(program_name, LOG_SPACE_SIZE, is_daemon, log_level, path);
+	ret = log_init(program_name, LOG_SPACE_SIZE, to_stdout, log_level, path);
 	if (ret)
 		exit(1);
 
-	ret = init_store(dir);
+	ret = init_store(dir, enable_write_cache);
 	if (ret)
 		exit(1);
 
@@ -192,20 +254,35 @@ int main(int argc, char **argv)
 	if (ret)
 		exit(1);
 
-	ret = create_cluster(port, zone);
+	ret = create_cluster(port, zone, nr_vnodes);
 	if (ret) {
 		eprintf("failed to create sheepdog cluster\n");
 		exit(1);
 	}
 
-	sys->cpg_wqueue = init_work_queue(1);
-	sys->gateway_wqueue = init_work_queue(NR_GW_WORKER_THREAD);
-	sys->io_wqueue = init_work_queue(NR_IO_WORKER_THREAD);
+	sys->gateway_wqueue = init_work_queue(nr_gateway_worker);
+	sys->io_wqueue = init_work_queue(nr_io_worker);
 	sys->recovery_wqueue = init_work_queue(1);
 	sys->deletion_wqueue = init_work_queue(1);
-	if (!sys->cpg_wqueue || !sys->gateway_wqueue || !sys->io_wqueue ||
-	    !sys->recovery_wqueue || !sys->deletion_wqueue)
+	sys->flush_wqueue = init_work_queue(1);
+	sys->block_wqueue = init_work_queue(1);
+	if (!sys->gateway_wqueue || !sys->io_wqueue ||
+	    !sys->recovery_wqueue || !sys->deletion_wqueue ||
+	    !sys->flush_wqueue || !sys->block_wqueue)
 		exit(1);
+
+	ret = init_signal();
+	if (ret)
+		exit(1);
+
+	ret = trace_init();
+	if (ret)
+		exit(1);
+
+	if (chdir(dir) < 0) {
+		fprintf(stderr, "failed to chdir to %s: %m\n", dir);
+		exit(1);
+	}
 
 	vprintf(SDOG_NOTICE, "sheepdog daemon (version %s) started\n", PACKAGE_VERSION);
 

@@ -11,48 +11,46 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <netdb.h>
 #include <search.h>
 #include <assert.h>
 #include <pthread.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <accord/accord.h>
+#include <accord.h>
 
 #include "cluster.h"
+#include "event.h"
 #include "work.h"
-
-#define MAX_EVENT_BUF_SIZE (64 * 1024)
 
 #define BASE_FILE "/sheepdog"
 #define LOCK_FILE BASE_FILE "/lock"
 #define QUEUE_FILE BASE_FILE "/queue"
 
 enum acrd_event_type {
-	EVENT_JOIN = 1,
+	EVENT_JOIN_REQUEST = 1,
+	EVENT_JOIN_RESPONSE,
 	EVENT_LEAVE,
+	EVENT_BLOCK,
 	EVENT_NOTIFY,
 };
 
 struct acrd_event {
 	enum acrd_event_type type;
-	struct sheepdog_node_list_entry sender;
+	struct sd_node sender;
 
 	size_t buf_len;
-	uint8_t buf[MAX_EVENT_BUF_SIZE];
+	uint8_t buf[SD_MAX_EVENT_BUF_SIZE];
 
 	size_t nr_nodes; /* the number of sheep */
-	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
+	struct sd_node nodes[SD_MAX_NODES];
 	uint64_t ids[SD_MAX_NODES];
 
 	enum cluster_join_result join_result;
 
-	void (*block_cb)(void *arg);
-
-	int blocked; /* set non-zero when sheep must block this event */
-	int callbacked; /* set non-zero if sheep already called block_cb() */
+	int callbacked; /* set non-zero after sd_block_handler() was called */
 };
 
-static struct sheepdog_node_list_entry this_node;
+static struct sd_node this_node;
 static uint64_t this_id;
 
 
@@ -167,8 +165,8 @@ again:
 	assert(rc == ACRD_SUCCESS);
 
 	if (queue_start_pos < 0) {
-		/* the first pushed data should be EVENT_JOIN */
-		assert(ev->type == EVENT_JOIN);
+		/* the first pushed data should be EVENT_JOIN_REQUEST */
+		assert(ev->type == EVENT_JOIN_REQUEST);
 		queue_start_pos = queue_end_pos;
 	}
 }
@@ -217,13 +215,9 @@ static int efd;
 
 static struct work_queue *acrd_wq;
 
-static struct cdrv_handlers acrd_hdlrs;
-static enum cluster_join_result (*acrd_check_join_cb)(
-	struct sheepdog_node_list_entry *joining, void *opaque);
-
 /* get node list from the last pushed data */
 static size_t get_nodes(struct acrd_handle *ah,
-			struct sheepdog_node_list_entry *nodes,
+			struct sd_node *nodes,
 			uint64_t *ids)
 {
 	int rc;
@@ -249,11 +243,11 @@ again:
 }
 
 static int add_event(struct acrd_handle *ah, enum acrd_event_type type,
-		     struct sheepdog_node_list_entry *node, void *buf,
-		     size_t buf_len, void (*block_cb)(void *arg))
+		     struct sd_node *node, void *buf,
+		     size_t buf_len)
 {
 	int idx;
-	struct sheepdog_node_list_entry *n;
+	struct sd_node *n;
 	uint64_t *i;
 	struct acrd_event ev;
 
@@ -268,8 +262,7 @@ static int add_event(struct acrd_handle *ah, enum acrd_event_type type,
 	ev.nr_nodes = get_nodes(ah, ev.nodes, ev.ids);
 
 	switch (type) {
-	case EVENT_JOIN:
-		ev.blocked = 1;
+	case EVENT_JOIN_REQUEST:
 		ev.nodes[ev.nr_nodes] = *node;
 		ev.ids[ev.nr_nodes] = this_id; /* must be local node */
 		ev.nr_nodes++;
@@ -286,66 +279,15 @@ static int add_event(struct acrd_handle *ah, enum acrd_event_type type,
 		memmove(i, i + 1, sizeof(*i) * (ev.nr_nodes - idx));
 		break;
 	case EVENT_NOTIFY:
-		ev.blocked = !!block_cb;
-		ev.block_cb = block_cb;
+	case EVENT_BLOCK:
 		break;
+	case EVENT_JOIN_RESPONSE:
+		abort();
 	}
 
 	acrd_queue_push(ah, &ev);
 out:
 	acrd_unlock(ah);
-	return 0;
-}
-
-static int get_addr(uint8_t *bytes)
-{
-	int ret;
-	char name[INET6_ADDRSTRLEN];
-	struct addrinfo hints, *res, *res0;
-
-	gethostname(name, sizeof(name));
-
-	memset(&hints, 0, sizeof(hints));
-
-	hints.ai_socktype = SOCK_STREAM;
-	ret = getaddrinfo(name, NULL, &hints, &res0);
-	if (ret)
-		exit(1);
-
-	for (res = res0; res; res = res->ai_next) {
-		if (res->ai_family == AF_INET) {
-			struct sockaddr_in *addr;
-			addr = (struct sockaddr_in *)res->ai_addr;
-
-			if (((char *) &addr->sin_addr)[0] == 127)
-				continue;
-
-			memset(bytes, 0, 12);
-			memcpy(bytes + 12, &addr->sin_addr, 4);
-			break;
-		} else if (res->ai_family == AF_INET6) {
-			struct sockaddr_in6 *addr;
-			uint8_t localhost[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
-						  0, 0, 0, 0, 0, 0, 0, 1 };
-
-			addr = (struct sockaddr_in6 *)res->ai_addr;
-
-			if (memcmp(&addr->sin6_addr, localhost, 16) == 0)
-				continue;
-
-			memcpy(bytes, &addr->sin6_addr, 16);
-			break;
-		} else
-			dprintf("unknown address family\n");
-	}
-
-	if (res == NULL) {
-		eprintf("failed to get address info\n");
-		return -1;
-	}
-
-	freeaddrinfo(res0);
-
 	return 0;
 }
 
@@ -398,7 +340,7 @@ static void __acrd_leave(struct work *work)
 	int i;
 	size_t nr_nodes;
 	uint64_t ids[SD_MAX_NODES];
-	struct sheepdog_node_list_entry nodes[SD_MAX_NODES];
+	struct sd_node nodes[SD_MAX_NODES];
 	struct acrd_tx *atx;
 
 	pthread_mutex_lock(&queue_lock);
@@ -416,8 +358,7 @@ static void __acrd_leave(struct work *work)
 
 	for (i = 0; i < nr_nodes; i++) {
 		if (ids[i] == info->left_nodeid) {
-			add_event(ah, EVENT_LEAVE, nodes + i, NULL, 0,
-				  NULL);
+			add_event(ah, EVENT_LEAVE, nodes + i, NULL, 0);
 			break;
 		}
 	}
@@ -467,10 +408,130 @@ static void acrd_watch_fn(struct acrd_handle *ah, struct acrd_watch_info *info,
 	eventfd_write(efd, value);
 }
 
-static int accord_init(struct cdrv_handlers *handlers, const char *option,
-		       uint8_t *myaddr)
+static int accord_join(struct sd_node *myself,
+		       void *opaque, size_t opaque_len)
 {
-	acrd_hdlrs = *handlers;
+	this_node = *myself;
+
+	return add_event(ahandle, EVENT_JOIN_REQUEST, &this_node,
+			 opaque, opaque_len);
+}
+
+static int accord_leave(void)
+{
+	return add_event(ahandle, EVENT_LEAVE, &this_node, NULL, 0);
+}
+
+static int accord_notify(void *msg, size_t msg_len)
+{
+	return add_event(ahandle, EVENT_NOTIFY, &this_node, msg, msg_len);
+}
+
+static void accord_block(void)
+{
+	add_event(ahandle, EVENT_BLOCK, &this_node, NULL, 0);
+}
+
+static void accord_unblock(void *msg, size_t msg_len)
+{
+	struct acrd_event ev;
+
+	pthread_mutex_lock(&queue_lock);
+
+	acrd_queue_pop(ahandle, &ev);
+
+	ev.type = EVENT_NOTIFY;
+	ev.buf_len = msg_len;
+	if (msg)
+		memcpy(ev.buf, msg, msg_len);
+
+	acrd_queue_push_back(ahandle, &ev);
+
+	pthread_mutex_unlock(&queue_lock);
+}
+
+static void acrd_handler(int listen_fd, int events, void *data)
+{
+	int ret;
+	eventfd_t value;
+	struct acrd_event ev;
+	enum cluster_join_result res;
+
+	if (events & EPOLLHUP) {
+		eprintf("accord driver received EPOLLHUP event, exiting.\n");
+		log_close();
+		exit(1);
+	}
+
+	dprintf("read event\n");
+
+	ret = eventfd_read(efd, &value);
+	if (ret < 0)
+		return;
+
+	pthread_mutex_lock(&queue_lock);
+
+	ret = acrd_queue_pop(ahandle, &ev);
+	if (ret < 0)
+		goto out;
+
+	switch (ev.type) {
+	case EVENT_JOIN_REQUEST:
+		if (!node_eq(&ev.nodes[0], &this_node)) {
+			acrd_queue_push_back(ahandle, NULL);
+			break;
+		}
+
+		res = sd_check_join_cb(&ev.sender, ev.buf);
+		ev.join_result = res;
+		ev.type = EVENT_JOIN_RESPONSE;
+		acrd_queue_push_back(ahandle, &ev);
+
+		if (res == CJ_RES_MASTER_TRANSFER) {
+			eprintf("failed to join sheepdog cluster: "
+				"please retry when master is up\n");
+			exit(1);
+		}
+		break;
+	case EVENT_JOIN_RESPONSE:
+		if (ev.join_result == CJ_RES_MASTER_TRANSFER) {
+			/* FIXME: This code is tricky, but Sheepdog assumes that */
+			/* nr_nodes = 1 when join_result = MASTER_TRANSFER... */
+			ev.nr_nodes = 1;
+			ev.nodes[0] = this_node;
+			ev.ids[0] = this_id;
+			acrd_queue_push_back(ahandle, &ev);
+			acrd_queue_pop(ahandle, &ev);
+		}
+
+		sd_join_handler(&ev.sender, ev.nodes, ev.nr_nodes,
+				    ev.join_result, ev.buf);
+		break;
+	case EVENT_LEAVE:
+		sd_leave_handler(&ev.sender, ev.nodes, ev.nr_nodes);
+		break;
+	case EVENT_BLOCK:
+		if (node_cmp(&ev.sender, &this_node) == 0 && !ev.callbacked) {
+			ev.callbacked = 1;
+
+			acrd_queue_push_back(ahandle, &ev);
+			sd_block_handler();
+		} else {
+			acrd_queue_push_back(ahandle, NULL);
+		}
+		break;
+	case EVENT_NOTIFY:
+		sd_notify_handler(&ev.sender, ev.buf, ev.buf_len);
+		break;
+	}
+out:
+	pthread_mutex_unlock(&queue_lock);
+}
+
+static int accord_init(const char *option)
+{
+	int ret;
+
 	if (!option) {
 		eprintf("specify one of the accord servers.\n");
 		eprintf("e.g. sheep /store -c accord:127.0.0.1\n");
@@ -485,9 +546,6 @@ static int accord_init(struct cdrv_handlers *handlers, const char *option,
 		return -1;
 	}
 
-	if (get_addr(myaddr) < 0)
-		return -1;
-
 	efd = eventfd(0, EFD_NONBLOCK);
 	if (efd < 0) {
 		eprintf("failed to create an event fd: %m\n");
@@ -495,6 +553,10 @@ static int accord_init(struct cdrv_handlers *handlers, const char *option,
 	}
 
 	acrd_wq = init_work_queue(1);
+	if (!acrd_wq) {
+		eprintf("failed to create accord workqueue: %m\n");
+		return -1;
+	}
 
 	pthread_cond_wait(&start_cond, &start_lock);
 	pthread_mutex_unlock(&start_lock);
@@ -511,129 +573,11 @@ static int accord_init(struct cdrv_handlers *handlers, const char *option,
 	acrd_add_watch(ahandle, QUEUE_FILE, ACRD_EVENT_PREFIX | ACRD_EVENT_ALL,
 		       acrd_watch_fn, NULL);
 
-	return efd;
-}
-
-static int accord_join(struct sheepdog_node_list_entry *myself,
-		       enum cluster_join_result (*check_join_cb)(
-			       struct sheepdog_node_list_entry *joining,
-			       void *opaque),
-		       void *opaque, size_t opaque_len)
-{
-	this_node = *myself;
-	acrd_check_join_cb = check_join_cb;
-
-	return add_event(ahandle, EVENT_JOIN, &this_node, opaque, opaque_len, NULL);
-}
-
-static int accord_leave(void)
-{
-	return add_event(ahandle, EVENT_LEAVE, &this_node, NULL, 0, NULL);
-}
-
-static int accord_notify(void *msg, size_t msg_len, void (*block_cb)(void *arg))
-{
-	return add_event(ahandle, EVENT_NOTIFY, &this_node, msg, msg_len, block_cb);
-}
-
-static void acrd_block(struct work *work)
-{
-	struct acrd_event ev;
-
-	pthread_mutex_lock(&queue_lock);
-
-	acrd_queue_pop(ahandle, &ev);
-
-	ev.block_cb(ev.buf);
-	ev.blocked = 0;
-
-	acrd_queue_push_back(ahandle, &ev);
-
-	pthread_mutex_unlock(&queue_lock);
-}
-
-static void acrd_block_done(struct work *work)
-{
-}
-
-static int accord_dispatch(void)
-{
-	int ret;
-	eventfd_t value;
-	struct acrd_event ev;
-	enum cluster_join_result res;
-	static struct work work = {
-		.fn = acrd_block,
-		.done = acrd_block_done,
-	};
-
-	dprintf("read event\n");
-	ret = eventfd_read(efd, &value);
-	if (ret < 0)
-		return 0;
-
-	pthread_mutex_lock(&queue_lock);
-
-	ret = acrd_queue_pop(ahandle, &ev);
-	if (ret < 0)
-		goto out;
-
-	switch (ev.type) {
-	case EVENT_JOIN:
-		if (ev.blocked) {
-			if (node_cmp(&ev.nodes[0], &this_node) == 0) {
-				res = acrd_check_join_cb(&ev.sender, ev.buf);
-				ev.join_result = res;
-				ev.blocked = 0;
-
-				acrd_queue_push_back(ahandle, &ev);
-
-				if (res == CJ_RES_MASTER_TRANSFER) {
-					eprintf("failed to join sheepdog cluster: "
-						"please retry when master is up\n");
-					exit(1);
-				}
-			} else
-				acrd_queue_push_back(ahandle, NULL);
-
-			goto out;
-		}
-
-		if (ev.join_result == CJ_RES_MASTER_TRANSFER) {
-			/* FIXME: This code is tricky, but Sheepdog assumes that */
-			/* nr_nodes = 1 when join_result = MASTER_TRANSFER... */
-			ev.nr_nodes = 1;
-			ev.nodes[0] = this_node;
-			ev.ids[0] = this_id;
-			acrd_queue_push_back(ahandle, &ev);
-			acrd_queue_pop(ahandle, &ev);
-		}
-
-		acrd_hdlrs.join_handler(&ev.sender, ev.nodes, ev.nr_nodes,
-				    ev.join_result, ev.buf);
-		break;
-	case EVENT_LEAVE:
-		acrd_hdlrs.leave_handler(&ev.sender, ev.nodes, ev.nr_nodes);
-		break;
-	case EVENT_NOTIFY:
-		if (ev.blocked) {
-			if (node_cmp(&ev.sender, &this_node) == 0 && !ev.callbacked) {
-				queue_work(acrd_wq, &work);
-
-				ev.callbacked = 1;
-
-				acrd_queue_push_back(ahandle, &ev);
-			} else
-				acrd_queue_push_back(ahandle, NULL);
-
-			goto out;
-		}
-
-		acrd_hdlrs.notify_handler(&ev.sender, ev.buf, ev.buf_len);
-		break;
+	ret = register_event(efd, acrd_handler, NULL);
+	if (ret) {
+		eprintf("failed to register accord event handler (%d)\n", ret);
+		return -1;
 	}
-out:
-	pthread_mutex_unlock(&queue_lock);
 
 	return 0;
 }
@@ -645,7 +589,8 @@ struct cluster_driver cdrv_accord = {
 	.join       = accord_join,
 	.leave      = accord_leave,
 	.notify     = accord_notify,
-	.dispatch   = accord_dispatch,
+	.block      = accord_block,
+	.unblock    = accord_unblock,
 };
 
 cdrv_register(cdrv_accord);

@@ -80,6 +80,11 @@ static inline void __list_del(struct list_head * prev, struct list_head * next)
 	prev->next = next;
 }
 
+static inline void __list_del_entry(struct list_head *entry)
+{
+	__list_del(entry->prev, entry->next);
+}
+
 static inline void list_del(struct list_head *entry)
 {
 	__list_del(entry->prev, entry->next);
@@ -88,8 +93,21 @@ static inline void list_del(struct list_head *entry)
 
 static inline void list_del_init(struct list_head *entry)
 {
-	__list_del(entry->prev, entry->next);
+	__list_del_entry(entry);
 	INIT_LIST_HEAD(entry);
+}
+
+static inline void list_move(struct list_head *list, struct list_head *head)
+{
+	__list_del_entry(list);
+	list_add(list, head);
+}
+
+static inline void list_move_tail(struct list_head *list,
+		struct list_head *head)
+{
+	__list_del_entry(list);
+	list_add_tail(list, head);
 }
 
 static inline void __list_splice(const struct list_head *list,
@@ -111,6 +129,15 @@ static inline void list_splice_init(struct list_head *list,
 {
 	if (!list_empty(list)) {
 		__list_splice(list, head, head->next);
+		INIT_LIST_HEAD(list);
+	}
+}
+
+static inline void list_splice_tail_init(struct list_head *list,
+					 struct list_head *head)
+{
+	if (!list_empty(list)) {
+		__list_splice(list, head->prev, head);
 		INIT_LIST_HEAD(list);
 	}
 }
@@ -142,6 +169,7 @@ static inline int hlist_unhashed(const struct hlist_node *h)
 	return !h->pprev;
 }
 
+__attribute__((always_inline))
 static inline int hlist_empty(const struct hlist_head *h)
 {
 	return !h->first;

@@ -20,7 +20,6 @@
 #include "sheep_priv.h"
 
 #define JRNL_END_MARK           0x87654321UL
-#define IS_END_MARK_SET(var)    (var == JRNL_END_MARK)
 
 /* Journal header for data object */
 struct jrnl_head {
@@ -31,7 +30,7 @@ struct jrnl_head {
 
 struct jrnl_descriptor {
 	struct jrnl_head head;
-	void *data;
+	const void *data;
 	int fd;      /* Open file fd */
 	int target_fd;
 	char path[256];
@@ -87,18 +86,6 @@ static int jrnl_remove(struct jrnl_descriptor *jd)
 		ret = SD_RES_SUCCESS;
 
 	return ret;
-}
-
-static int jrnl_has_end_mark(struct jrnl_descriptor *jd)
-{
-	ssize_t ret;
-	uint32_t end_mark = 0;
-	struct jrnl_head *head = (struct jrnl_head *) &jd->head;
-
-	ret = pread64(jd->fd, &end_mark, sizeof(end_mark),
-		      sizeof(*head) + head->size);
-
-	return IS_END_MARK_SET(end_mark);
 }
 
 static int jrnl_write_header(struct jrnl_descriptor *jd)
@@ -192,7 +179,7 @@ static int jrnl_apply_to_target_object(struct jrnl_descriptor *jd)
 /*
  * We cannot use this function for concurrent write operations
  */
-struct jrnl_descriptor *jrnl_begin(void *buf, size_t count, off_t offset,
+struct jrnl_descriptor *jrnl_begin(const void *buf, size_t count, off_t offset,
 		 const char *path, const char *jrnl_dir)
 {
 	int ret;
@@ -237,6 +224,7 @@ int jrnl_end(struct jrnl_descriptor * jd)
 
 	ret = jrnl_remove(jd);
 err:
+	free(jd);
 	return ret;
 }
 
@@ -253,8 +241,9 @@ int jrnl_recover(const char *jrnl_dir)
 
 	vprintf(SDOG_NOTICE, "starting journal recovery\n");
 	while ((d = readdir(dir))) {
-		int ret;
 		struct jrnl_descriptor jd;
+		uint32_t end_mark = 0;
+		int ret;
 
 		if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
 			continue;
@@ -267,8 +256,18 @@ int jrnl_recover(const char *jrnl_dir)
 				jrnl_file_path);
 			goto end_while_3;
 		}
-		if (!jrnl_has_end_mark(&jd))
+
+		ret = pread64(jd.fd, &end_mark, sizeof(end_mark),
+				sizeof(jd.head) + jd.head.size);
+		if (ret != sizeof(end_mark)) {
+			eprintf("can't read journal end mark for object %s\n",
+				jd.head.target_path);
 			goto end_while_2;
+		}
+
+		if (end_mark != JRNL_END_MARK)
+			goto end_while_2;
+
 		jd.target_fd = open(jd.head.target_path, O_DSYNC | O_RDWR);
 		if (ret) {
 			eprintf("unable to open the object file %s for recovery\n",

@@ -40,29 +40,32 @@ static const struct sd_option collie_options[] = {
 	{'d', "delete", 0, "delete a key"},
 
 	/* cluster options */
+	{'b', "store", 1, "specify backend store"},
 	{'c', "copies", 1, "specify the data redundancy (number of copies)"},
 	{'H', "nohalt", 0, "serve IO requests even if there are too few\n\
                           nodes for the configured redundancy"},
 	{'f', "force", 0, "do not prompt for confirmation"},
+	{'R', "restore", 1, "restore the cluster"},
+	{'l', "list", 0, "list the user epoch information"},
 
 	{ 0, NULL, 0, NULL },
 };
 
 static void usage(struct command *commands, int status);
 
-uint64_t node_list_version;
+uint32_t node_list_version;
 
-struct sheepdog_node_list_entry node_list_entries[SD_MAX_NODES];
-struct sheepdog_vnode_list_entry vnode_list_entries[SD_MAX_VNODES];
+struct sd_node node_list_entries[SD_MAX_NODES];
+struct sd_vnode vnode_list_entries[SD_MAX_VNODES];
 int nr_nodes, nr_vnodes;
 unsigned master_idx;
 
-static int update_node_list(int max_nodes, int epoch)
+static int update_node_list(int max_nodes, uint32_t epoch)
 {
 	int fd, ret;
 	unsigned int size, wlen;
 	char *buf = NULL;
-	struct sheepdog_node_list_entry *ent;
+	struct sd_node *ent;
 	struct sd_node_req hdr;
 	struct sd_node_rsp *rsp = (struct sd_node_rsp *)&hdr;
 
@@ -284,6 +287,7 @@ int main(int argc, char **argv)
 		vdi_command,
 		node_command,
 		cluster_command,
+		debug_command,
 		{NULL,}
 	};
 

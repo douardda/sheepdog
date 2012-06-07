@@ -22,15 +22,18 @@
 #define SD_OP_CREATE_AND_WRITE_OBJ  0x01
 #define SD_OP_READ_OBJ       0x02
 #define SD_OP_WRITE_OBJ      0x03
+#define SD_OP_REMOVE_OBJ     0x04
 
 #define SD_OP_NEW_VDI        0x11
 #define SD_OP_LOCK_VDI       0x12
 #define SD_OP_RELEASE_VDI    0x13
 #define SD_OP_GET_VDI_INFO   0x14
 #define SD_OP_READ_VDIS      0x15
+#define SD_OP_FLUSH_VDI      0x16
 
 #define SD_FLAG_CMD_WRITE    0x01
 #define SD_FLAG_CMD_COW      0x02
+#define SD_FLAG_CMD_CACHE    0x04
 
 #define SD_RES_SUCCESS       0x00 /* Success */
 #define SD_RES_UNKNOWN       0x01 /* Unknown error */
@@ -59,6 +62,10 @@
 #define SD_RES_JOIN_FAILED   0x18 /* Target node had failed to join sheepdog */
 #define SD_RES_HALT 0x19 /* Sheepdog is stopped doing IO */
 #define SD_RES_MANUAL_RECOVER   0x1A /* Users should not manually recover this cluster */
+#define SD_RES_NO_STORE         0x20 /* No targeted backend store */
+#define SD_RES_NO_SUPPORT       0x21 /* Operation is not supported by backend store */
+#define SD_RES_CLUSTER_RECOVERING 0x22 /* Cluster is recovering. */
+#define SD_RES_OBJ_RECOVERING     0x23 /* Object is recovering */
 
 /*
  * Object ID rules
@@ -91,6 +98,8 @@
 #define SD_ATTR_OBJ_SIZE (sizeof(struct sheepdog_vdi_attr))
 #define CURRENT_VDI_ID 0
 
+#define STORE_LEN 16
+
 struct sd_req {
 	uint8_t		proto_ver;
 	uint8_t		opcode;
@@ -98,7 +107,22 @@ struct sd_req {
 	uint32_t	epoch;
 	uint32_t        id;
 	uint32_t        data_length;
-	uint32_t	opcode_specific[8];
+	union {
+		struct {
+			uint64_t	oid;
+			uint64_t	cow_oid;
+			uint32_t	copies;
+			uint32_t	tgt_epoch;
+			uint64_t	offset;
+		} obj;
+		struct {
+			uint64_t	vdi_size;
+			uint32_t	base_vdi_id;
+			uint32_t	copies;
+			uint32_t	snapid;
+		} vdi;
+		uint32_t		__pad[8];
+	};
 };
 
 struct sd_rsp {
@@ -109,62 +133,18 @@ struct sd_rsp {
 	uint32_t        id;
 	uint32_t        data_length;
 	uint32_t        result;
-	uint32_t	opcode_specific[7];
-};
-
-struct sd_obj_req {
-	uint8_t		proto_ver;
-	uint8_t		opcode;
-	uint16_t	flags;
-	uint32_t	epoch;
-	uint32_t        id;
-	uint32_t        data_length;
-	uint64_t        oid;
-	uint64_t        cow_oid;
-	uint32_t        copies;
-	uint32_t        tgt_epoch;
-	uint64_t        offset;
-};
-
-struct sd_obj_rsp {
-	uint8_t		proto_ver;
-	uint8_t		opcode;
-	uint16_t	flags;
-	uint32_t	epoch;
-	uint32_t        id;
-	uint32_t        data_length;
-	uint32_t        result;
-	uint32_t        copies;
-	uint32_t        pad[6];
-};
-
-struct sd_vdi_req {
-	uint8_t		proto_ver;
-	uint8_t		opcode;
-	uint16_t	flags;
-	uint32_t	epoch;
-	uint32_t        id;
-	uint32_t        data_length;
-	uint64_t	vdi_size;
-	uint32_t        base_vdi_id;
-	uint32_t	copies;
-	uint32_t        snapid;
-	uint32_t        pad[3];
-};
-
-struct sd_vdi_rsp {
-	uint8_t		proto_ver;
-	uint8_t		opcode;
-	uint16_t	flags;
-	uint32_t	epoch;
-	uint32_t        id;
-	uint32_t        data_length;
-	uint32_t        result;
-	uint32_t        rsvd;
-	uint32_t        vdi_id;
-	uint32_t        attr_id;
-	uint32_t        copies;
-	uint32_t        pad[3];
+	union {
+		struct {
+			uint32_t	copies;
+		} obj;
+		struct {
+			uint32_t	rsvd;
+			uint32_t	vdi_id;
+			uint32_t	attr_id;
+			uint32_t	copies;
+		} vdi;
+		uint32_t		__pad[7];
+	};
 };
 
 struct sheepdog_inode {
@@ -193,6 +173,14 @@ struct sheepdog_vdi_attr {
 	uint32_t value_len;
 	char key[SD_MAX_VDI_ATTR_KEY_LEN];
 	char value[SD_MAX_VDI_ATTR_VALUE_LEN];
+};
+
+#define SHA1_LEN        20
+
+struct snap_log {
+	uint32_t epoch;
+	uint64_t time;
+	unsigned char sha1[SHA1_LEN];
 };
 
 /*

@@ -32,6 +32,9 @@ struct get_vdi_info {
 	uint32_t snapid;
 };
 
+struct sd_node latest_node_list[SD_MAX_NODES];
+int nr_latest_node_list;
+
 static int parse_option_size(const char *value, uint64_t *ret)
 {
 	char *postfix;
@@ -65,7 +68,7 @@ static int parse_option_size(const char *value, uint64_t *ret)
 static void print_vdi_list(uint32_t vid, char *name, char *tag, uint32_t snapid,
 			   uint32_t flags, struct sheepdog_inode *i, void *data)
 {
-	int idx;
+	int idx, is_clone = 0;
 	uint64_t my_objs, cow_objs;
 	char vdi_size_str[16], my_objs_str[16], cow_objs_str[16];
 	time_t ti;
@@ -100,19 +103,24 @@ static void print_vdi_list(uint32_t vid, char *name, char *tag, uint32_t snapid,
 	size_to_str(my_objs * SD_DATA_OBJ_SIZE, my_objs_str, sizeof(my_objs_str));
 	size_to_str(cow_objs * SD_DATA_OBJ_SIZE, cow_objs_str, sizeof(cow_objs_str));
 
+	if (i->snap_id == 1 && i->parent_vdi_id != 0)
+		is_clone = 1;
+
 	if (raw_output) {
-		printf("%c ", is_current(i) ? '=' : 's');
+		printf("%c ", is_current(i) ? (is_clone ? 'c' : '=') : 's');
 		while (*name) {
 			if (isspace(*name) || *name == '\\')
 				putchar('\\');
 			putchar(*name++);
 		}
-		printf(" %d %s %s %s %s %" PRIx32 "\n", snapid,
-				vdi_size_str, my_objs_str, cow_objs_str, dbuf, vid);
+		printf(" %d %s %s %s %s %" PRIx32 " %s\n", snapid,
+				vdi_size_str, my_objs_str, cow_objs_str, dbuf, vid,
+				i->tag);
 	} else {
-		printf("%c %-8s %5d %7s %7s %7s %s  %7" PRIx32 "\n",
-				is_current(i) ? ' ' : 's', name, snapid,
-				vdi_size_str, my_objs_str, cow_objs_str, dbuf, vid);
+		printf("%c %-8s %5d %7s %7s %7s %s  %7" PRIx32 "  %s\n",
+				is_current(i) ? (is_clone ? 'c' : ' ') : 's',
+				name, snapid, vdi_size_str, my_objs_str, cow_objs_str,
+				dbuf, vid, i->tag);
 	}
 }
 
@@ -188,16 +196,16 @@ static void get_oid(uint32_t vid, char *name, char *tag, uint32_t snapid,
 	}
 }
 
-typedef void (*obj_parser_func_t)(char *sheep, uint64_t oid,
-				  struct sd_obj_rsp *rsp, char *buf, void *data);
+typedef int (*obj_parser_func_t)(char *sheep, uint64_t oid,
+				  struct sd_rsp *rsp, char *buf, void *data);
 
-static void do_print_obj(char *sheep, uint64_t oid, struct sd_obj_rsp *rsp,
+static int do_print_obj(char *sheep, uint64_t oid, struct sd_rsp *rsp,
 			 char *buf, void *data)
 {
 	switch (rsp->result) {
 	case SD_RES_SUCCESS:
 		printf("%s has the object (should be %d copies)\n",
-		       sheep, rsp->copies);
+		       sheep, rsp->obj.copies);
 		break;
 	case SD_RES_NO_OBJ:
 		printf("%s doesn't have the object\n", sheep);
@@ -211,6 +219,8 @@ static void do_print_obj(char *sheep, uint64_t oid, struct sd_obj_rsp *rsp,
 		       sheep, rsp->result);
 		break;
 	}
+
+	return 0;
 }
 
 struct get_data_oid_info {
@@ -219,7 +229,7 @@ struct get_data_oid_info {
 	unsigned idx;
 };
 
-static void get_data_oid(char *sheep, uint64_t oid, struct sd_obj_rsp *rsp,
+static int get_data_oid(char *sheep, uint64_t oid, struct sd_rsp *rsp,
 			 char *buf, void *data)
 {
 	struct get_data_oid_info *info = data;
@@ -230,8 +240,10 @@ static void get_data_oid(char *sheep, uint64_t oid, struct sd_obj_rsp *rsp,
 		if (info->success)
 			break;
 		info->success = 1;
-		if (inode->data_vdi_id[info->idx])
+		if (inode->data_vdi_id[info->idx]) {
 			info->data_oid = vid_to_data_oid(inode->data_vdi_id[info->idx], info->idx);
+			return 1;
+		}
 		break;
 	case SD_RES_NO_OBJ:
 		break;
@@ -244,12 +256,14 @@ static void get_data_oid(char *sheep, uint64_t oid, struct sd_obj_rsp *rsp,
 		       sheep, rsp->result);
 		break;
 	}
+
+	return 0;
 }
 
 static void parse_objs(uint64_t oid, obj_parser_func_t func, void *data, unsigned size)
 {
 	char name[128];
-	int i, fd, ret;
+	int i, fd, ret, cb_ret;
 	char *buf;
 
 	buf = zalloc(size);
@@ -260,8 +274,8 @@ static void parse_objs(uint64_t oid, obj_parser_func_t func, void *data, unsigne
 
 	for (i = 0; i < nr_nodes; i++) {
 		unsigned wlen = 0, rlen = size;
-		struct sd_obj_req hdr;
-		struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
+		struct sd_req hdr;
+		struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
 
 		addr_to_str(name, sizeof(name), node_list_entries[i].addr, 0);
 
@@ -274,18 +288,22 @@ static void parse_objs(uint64_t oid, obj_parser_func_t func, void *data, unsigne
 		hdr.opcode = SD_OP_READ_OBJ;
 		hdr.data_length = rlen;
 		hdr.flags = SD_FLAG_CMD_IO_LOCAL;
-		hdr.oid = oid;
 		hdr.epoch = node_list_version;
 
-		ret = exec_req(fd, (struct sd_req *)&hdr, buf, &wlen, &rlen);
+		hdr.obj.oid = oid;
+
+		ret = exec_req(fd, &hdr, buf, &wlen, &rlen);
 		close(fd);
 
 		sprintf(name + strlen(name), ":%d", node_list_entries[i].port);
 
 		if (ret)
 			fprintf(stderr, "Failed to connect to %s\n", name);
-		else
-			func(name, oid, rsp, buf, data);
+		else {
+			cb_ret = func(name, oid, rsp, buf, data);
+			if (cb_ret)
+				break;
+		}
 	}
 
 	free(buf);
@@ -297,16 +315,18 @@ static int vdi_list(int argc, char **argv)
 	char *vdiname = argv[optind];
 
 	if (!raw_output)
-		printf("  Name        Id    Size    Used  Shared    Creation time   VDI id\n");
+		printf("  Name        Id    Size    Used  Shared    Creation time   VDI id  Tag\n");
 
 	if (vdiname) {
 		struct get_vdi_info info;
 		memset(&info, 0, sizeof(info));
 		info.name = vdiname;
-		parse_vdi(print_vdi_list, SD_INODE_SIZE, &info);
+		if (parse_vdi(print_vdi_list, SD_INODE_SIZE, &info) < 0)
+			return EXIT_SYSFAIL;
 		return EXIT_SUCCESS;
 	} else {
-		parse_vdi(print_vdi_list, SD_INODE_SIZE, NULL);
+		if (parse_vdi(print_vdi_list, SD_INODE_SIZE, NULL) < 0)
+			return EXIT_SYSFAIL;
 		return EXIT_SUCCESS;
 	}
 }
@@ -314,7 +334,8 @@ static int vdi_list(int argc, char **argv)
 static int vdi_tree(int argc, char **argv)
 {
 	init_tree();
-	parse_vdi(print_vdi_tree, SD_INODE_HEADER_SIZE, NULL);
+	if (parse_vdi(print_vdi_tree, SD_INODE_HEADER_SIZE, NULL) < 0)
+		return EXIT_SYSFAIL;
 	dump_tree();
 
 	return EXIT_SUCCESS;
@@ -327,7 +348,8 @@ static int vdi_graph(int argc, char **argv)
 	printf("  node [shape = \"box\", fontname = \"Courier\"];\n\n");
 	printf("  \"0\" [shape = \"ellipse\", label = \"root\"];\n\n");
 
-	parse_vdi(print_vdi_graph, SD_INODE_HEADER_SIZE, NULL);
+	if (parse_vdi(print_vdi_graph, SD_INODE_HEADER_SIZE, NULL) < 0)
+		return EXIT_SYSFAIL;
 
 	/* print a footer */
 	printf("}\n");
@@ -339,8 +361,8 @@ static int find_vdi_name(char *vdiname, uint32_t snapid, const char *tag,
 			 uint32_t *vid, int for_snapshot)
 {
 	int ret, fd;
-	struct sd_vdi_req hdr;
-	struct sd_vdi_rsp *rsp = (struct sd_vdi_rsp *)&hdr;
+	struct sd_req hdr;
+	struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
 	unsigned int wlen, rlen = 0;
 	char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
 
@@ -360,10 +382,10 @@ static int find_vdi_name(char *vdiname, uint32_t snapid, const char *tag,
 	wlen = SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN;
 	hdr.proto_ver = SD_PROTO_VER;
 	hdr.data_length = wlen;
-	hdr.snapid = snapid;
 	hdr.flags = SD_FLAG_CMD_WRITE;
+	hdr.vdi.snapid = snapid;
 
-	ret = exec_req(fd, (struct sd_req *)&hdr, buf, &wlen, &rlen);
+	ret = exec_req(fd, &hdr, buf, &wlen, &rlen);
 	if (ret) {
 		ret = -1;
 		goto out;
@@ -375,7 +397,7 @@ static int find_vdi_name(char *vdiname, uint32_t snapid, const char *tag,
 		ret = -1;
 		goto out;
 	}
-	*vid = rsp->vdi_id;
+	*vid = rsp->vdi.vdi_id;
 
 	ret = 0;
 out:
@@ -386,8 +408,8 @@ out:
 static int do_vdi_create(char *vdiname, int64_t vdi_size, uint32_t base_vid,
 			 uint32_t *vdi_id, int snapshot)
 {
-	struct sd_vdi_req hdr;
-	struct sd_vdi_rsp *rsp = (struct sd_vdi_rsp *)&hdr;
+	struct sd_req hdr;
+	struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
 	int fd, ret;
 	unsigned int wlen, rlen = 0;
 	char buf[SD_MAX_VDI_LEN];
@@ -401,19 +423,18 @@ static int do_vdi_create(char *vdiname, int64_t vdi_size, uint32_t base_vid,
 	memset(buf, 0, sizeof(buf));
 	strncpy(buf, vdiname, SD_MAX_VDI_LEN);
 
-	memset(&hdr, 0, sizeof(hdr));
-	hdr.opcode = SD_OP_NEW_VDI;
-	hdr.base_vdi_id = base_vid;
-
 	wlen = SD_MAX_VDI_LEN;
 
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.opcode = SD_OP_NEW_VDI;
 	hdr.flags = SD_FLAG_CMD_WRITE;
-	hdr.snapid = snapshot;
-
 	hdr.data_length = wlen;
-	hdr.vdi_size = vdi_size;
 
-	ret = exec_req(fd, (struct sd_req *)&hdr, buf, &wlen, &rlen);
+	hdr.vdi.base_vdi_id = base_vid;
+	hdr.vdi.snapid = snapshot;
+	hdr.vdi.vdi_size = roundup(vdi_size, 512);
+
+	ret = exec_req(fd, &hdr, buf, &wlen, &rlen);
 
 	close(fd);
 
@@ -429,7 +450,7 @@ static int do_vdi_create(char *vdiname, int64_t vdi_size, uint32_t base_vid,
 	}
 
 	if (vdi_id)
-		*vdi_id = rsp->vdi_id;
+		*vdi_id = rsp->vdi.vdi_id;
 
 	return EXIT_SUCCESS;
 }
@@ -682,8 +703,8 @@ static int vdi_delete(int argc, char **argv)
 {
 	char *data = argv[optind];
 	int fd, ret;
-	struct sd_vdi_req hdr;
-	struct sd_vdi_rsp *rsp = (struct sd_vdi_rsp *)&hdr;
+	struct sd_req hdr;
+	struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
 	unsigned rlen, wlen;
 	char vdiname[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
 
@@ -697,16 +718,16 @@ static int vdi_delete(int argc, char **argv)
 	wlen = sizeof(vdiname);
 
 	hdr.opcode = SD_OP_DEL_VDI;
-	hdr.snapid = vdi_cmd_data.snapshot_id;
 	hdr.epoch = node_list_version;
 	hdr.flags = SD_FLAG_CMD_WRITE;
 	hdr.data_length = wlen;
+	hdr.vdi.snapid = vdi_cmd_data.snapshot_id;
 	memset(vdiname, 0, sizeof(vdiname));
 	strncpy(vdiname, data, SD_MAX_VDI_LEN);
 	strncpy(vdiname + SD_MAX_VDI_LEN, vdi_cmd_data.snapshot_tag,
 		SD_MAX_VDI_TAG_LEN);
 
-	ret = exec_req(fd, (struct sd_req *)&hdr, vdiname, &wlen, &rlen);
+	ret = exec_req(fd, &hdr, vdiname, &wlen, &rlen);
 	close(fd);
 
 	if (ret) {
@@ -730,7 +751,6 @@ static int vdi_object(int argc, char **argv)
 {
 	char *vdiname = argv[optind];
 	unsigned idx = vdi_cmd_data.index;
-	int ret;
 	struct get_vdi_info info;
 	uint32_t vid;
 
@@ -740,7 +760,8 @@ static int vdi_object(int argc, char **argv)
 	info.vid = 0;
 	info.snapid = vdi_cmd_data.snapshot_id;
 
-	ret = parse_vdi(get_oid, SD_INODE_HEADER_SIZE, &info);
+	if (parse_vdi(get_oid, SD_INODE_HEADER_SIZE, &info) < 0)
+		return EXIT_SYSFAIL;
 
 	vid = info.vid;
 	if (vid == 0) {
@@ -782,13 +803,139 @@ static int vdi_object(int argc, char **argv)
 	return EXIT_SUCCESS;
 }
 
+static int print_obj_epoch(uint64_t oid)
+{
+	int i, j, fd, ret, idx;
+	struct sd_req hdr;
+	struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
+	unsigned rlen, wlen;
+	struct sd_vnode vnodes[SD_MAX_VNODES];
+	int idx_buf[SD_MAX_COPIES];
+	struct epoch_log *logs;
+	int vnodes_nr, nr_logs, log_length;
+	char host[128];
+
+	log_length = node_list_version * sizeof(struct epoch_log);
+again:
+	logs = malloc(log_length);
+	if (!logs) {
+		if (log_length < 10) {
+			fprintf(stderr, "No memory to allocate.\n");
+			return EXIT_SYSFAIL;
+		}
+		log_length /= 2;
+		goto again;
+	}
+
+	fd = connect_to(sdhost, sdport);
+	if (fd < 0)
+		goto error;
+
+	memset(&hdr, 0, sizeof(hdr));
+
+	hdr.opcode = SD_OP_STAT_CLUSTER;
+	hdr.epoch = node_list_version;
+	hdr.data_length = log_length;
+
+	rlen = hdr.data_length;
+	wlen = 0;
+	ret = exec_req(fd, &hdr, logs, &wlen, &rlen);
+	close(fd);
+
+	if (ret != 0)
+		goto error;
+
+	if (rsp->result != SD_RES_SUCCESS)
+		printf("%s\n", sd_strerror(rsp->result));
+
+	nr_logs = rsp->data_length / sizeof(struct epoch_log);
+	for (i = nr_logs - 1; i >= 0; i--) {
+		vnodes_nr = nodes_to_vnodes(logs[i].nodes, logs[i].nr_nodes, vnodes);
+		printf("\nobj %"PRIx64" locations at epoch %d, copies = %d\n",
+				oid, logs[i].epoch, logs[i].nr_copies);
+		printf("---------------------------------------------------\n");
+		obj_to_sheeps(vnodes, vnodes_nr, oid,
+				logs[i].nr_copies, idx_buf);
+		for (j = 0; j < logs[i].nr_copies; j++) {
+			idx = idx_buf[j];
+			addr_to_str(host, sizeof(host), vnodes[idx].addr,
+					vnodes[idx].port);
+			printf("%s\n", host);
+		}
+	}
+
+	free(logs);
+	return EXIT_SUCCESS;
+error:
+	free(logs);
+	return EXIT_SYSFAIL;
+}
+
+static int vdi_track(int argc, char **argv)
+{
+	char *vdiname = argv[optind];
+	unsigned idx = vdi_cmd_data.index;
+	struct get_vdi_info info;
+	uint32_t vid;
+
+	memset(&info, 0, sizeof(info));
+	info.name = vdiname;
+	info.tag = vdi_cmd_data.snapshot_tag;
+	info.vid = 0;
+	info.snapid = vdi_cmd_data.snapshot_id;
+
+	if (parse_vdi(get_oid, SD_INODE_HEADER_SIZE, &info) < 0)
+		return EXIT_SYSFAIL;
+
+	vid = info.vid;
+	if (vid == 0) {
+		fprintf(stderr, "VDI not found\n");
+		return EXIT_MISSING;
+	}
+
+	if (idx == ~0) {
+		printf("Tracking the inode object 0x%" PRIx32 " with %d nodes\n",
+		       vid, nr_nodes);
+		print_obj_epoch(vid_to_vdi_oid(vid));
+	} else {
+		struct get_data_oid_info oid_info;
+
+		oid_info.success = 0;
+		oid_info.idx = idx;
+
+		if (idx >= MAX_DATA_OBJS) {
+			printf("The offset is too large!\n");
+			exit(EXIT_FAILURE);
+		}
+
+		parse_objs(vid_to_vdi_oid(vid), get_data_oid,
+					&oid_info, SD_DATA_OBJ_SIZE);
+
+		if (oid_info.success) {
+			if (oid_info.data_oid) {
+				printf("Tracking the object 0x%" PRIx64
+				       " (the inode vid 0x%" PRIx32 " idx %u)"
+					   " with %d nodes\n",
+				       oid_info.data_oid, vid, idx, nr_nodes);
+				print_obj_epoch(oid_info.data_oid);
+
+			} else
+				printf("The inode object 0x%" PRIx32 " idx %u is not allocated\n",
+				       vid, idx);
+		} else
+			fprintf(stderr, "Failed to read the inode object 0x%"PRIx32"\n", vid);
+	}
+
+	return EXIT_SUCCESS;
+}
+
 static int find_vdi_attr_oid(char *vdiname, char *tag, uint32_t snapid,
 			     char *key, void *value, unsigned int value_len,
 			     uint32_t *vid, uint64_t *oid, unsigned int *nr_copies,
 			     int creat, int excl, int delete)
 {
-	struct sd_vdi_req hdr;
-	struct sd_vdi_rsp *rsp = (struct sd_vdi_rsp *)&hdr;
+	struct sd_req hdr;
+	struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
 	int fd, ret;
 	unsigned int wlen, rlen;
 	struct sheepdog_vdi_attr vattr;
@@ -813,9 +960,10 @@ static int find_vdi_attr_oid(char *vdiname, char *tag, uint32_t snapid,
 	wlen = SD_ATTR_OBJ_SIZE;
 	rlen = 0;
 	hdr.proto_ver = SD_PROTO_VER;
-	hdr.data_length = wlen;
-	hdr.snapid = vdi_cmd_data.snapshot_id;
 	hdr.flags = SD_FLAG_CMD_WRITE;
+	hdr.data_length = wlen;
+	hdr.vdi.snapid = vdi_cmd_data.snapshot_id;
+
 	if (creat)
 		hdr.flags |= SD_FLAG_CMD_CREAT;
 	if (excl)
@@ -823,7 +971,7 @@ static int find_vdi_attr_oid(char *vdiname, char *tag, uint32_t snapid,
 	if (delete)
 		hdr.flags |= SD_FLAG_CMD_DEL;
 
-	ret = exec_req(fd, (struct sd_req *)&hdr, &vattr, &wlen, &rlen);
+	ret = exec_req(fd, &hdr, &vattr, &wlen, &rlen);
 	if (ret) {
 		ret = SD_RES_EIO;
 		goto out;
@@ -834,9 +982,9 @@ static int find_vdi_attr_oid(char *vdiname, char *tag, uint32_t snapid,
 		goto out;
 	}
 
-	*vid = rsp->vdi_id;
-	*oid = vid_to_attr_oid(rsp->vdi_id, rsp->attr_id);
-	*nr_copies = rsp->copies;
+	*vid = rsp->vdi.vdi_id;
+	*oid = vid_to_attr_oid(rsp->vdi.vdi_id, rsp->vdi.attr_id);
+	*nr_copies = rsp->vdi.copies;
 
 	ret = SD_RES_SUCCESS;
 out:
@@ -971,10 +1119,6 @@ static int vdi_read(int argc, char **argv)
 			ret = parse_option_size(argv[optind++], &total);
 			if (ret < 0)
 				return EXIT_USAGE;
-			if (total % 512 != 0) {
-				fprintf(stderr, "Read length must be block-aligned\n");
-				return EXIT_USAGE;
-			}
 		}
 	}
 
@@ -1071,10 +1215,6 @@ static int vdi_write(int argc, char **argv)
 			ret = parse_option_size(argv[optind++], &total);
 			if (ret < 0)
 				return EXIT_USAGE;
-			if (total % 512 != 0) {
-				fprintf(stderr, "Write length must be block-aligned\n");
-				return EXIT_USAGE;
-			}
 		}
 	}
 
@@ -1196,6 +1336,8 @@ static struct subcommand vdi_cmd[] = {
 	 SUBCMD_FLAG_NEED_NODELIST, vdi_graph},
 	{"object", "<vdiname>", "isaph", "show object information in the image",
 	 SUBCMD_FLAG_NEED_NODELIST|SUBCMD_FLAG_NEED_THIRD_ARG, vdi_object},
+	{"track", "<vdiname>", "isaph", "show the object epoch trace in the image",
+	 SUBCMD_FLAG_NEED_NODELIST|SUBCMD_FLAG_NEED_THIRD_ARG, vdi_track},
 	{"setattr", "<vdiname> <key> [value]", "dxaph", "set a VDI attribute",
 	 SUBCMD_FLAG_NEED_NODELIST|SUBCMD_FLAG_NEED_THIRD_ARG, vdi_setattr},
 	{"getattr", "<vdiname> <key>", "aph", "get a VDI attribute",

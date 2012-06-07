@@ -15,11 +15,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <arpa/inet.h>
 #include <memory.h>
 
 #include "sheepdog_proto.h"
 #include "sheep.h"
 #include "logger.h"
+
+/* maximum payload size sent in ->notify and ->unblock */
+#define SD_MAX_EVENT_BUF_SIZE (64 * 1024)
 
 enum cluster_join_result {
 	CJ_RES_SUCCESS, /* Success */
@@ -31,49 +35,41 @@ enum cluster_join_result {
 				 * will leave the cluster (restart later). */
 };
 
-struct cdrv_handlers {
-	void (*join_handler)(struct sheepdog_node_list_entry *joined,
-			     struct sheepdog_node_list_entry *members,
-			     size_t nr_members, enum cluster_join_result result,
-			     void *opaque);
-	void (*leave_handler)(struct sheepdog_node_list_entry *left,
-			      struct sheepdog_node_list_entry *members,
-			      size_t nr_members);
-	void (*notify_handler)(struct sheepdog_node_list_entry *sender,
-			       void *msg, size_t msg_len);
-};
-
 struct cluster_driver {
 	const char *name;
 
 	/*
 	 * Initialize the cluster driver
 	 *
-	 * On success, this function returns the file descriptor that
-	 * may be used with the poll(2) to monitor cluster events.  On
-	 * error, returns -1.
+	 * Returns zero on success, -1 on error.
 	 */
-	int (*init)(struct cdrv_handlers *handlers, const char *option,
-		    uint8_t *myaddr);
+	int (*init)(const char *option);
+
+	/*
+	 * Get a node ID for this sheep.
+	 *
+	 * Gets and ID that is used in all communication with other sheep,
+	 * which normally would be a string formatted IP address.
+	 *
+	 * Returns zero on success, -1 on error.
+	 */
+	int (*get_local_addr)(uint8_t *myaddr);
 
 	/*
 	 * Join the cluster
 	 *
-	 * This function is used to join the cluster, and notifies a
-	 * join event to all the nodes.  The copy of 'opaque' is
-	 * passed to check_join_cb() and join_handler().
-	 * check_join_cb() is called on one of the nodes which already
+	 * This function is used to join the cluster, and notifies a join
+	 * event to all the nodes.  The copy of 'opaque' is passed to
+	 * sd_check_join_cb() and sd_join_handler().
+	 *
+	 * sd_check_join_cb() is called on one of the nodes which already
 	 * paticipate in the cluster.  If the content of 'opaque' is
-	 * changed in check_join_cb(), the updated 'opaque' must be
-	 * passed to join_handler().
+	 * changed in sd_check_join_cb(), the updated 'opaque' must be
+	 * passed to sd_join_handler().
 	 *
 	 * Returns zero on success, -1 on error
 	 */
-	int (*join)(struct sheepdog_node_list_entry *myself,
-		    enum cluster_join_result (*check_join_cb)(
-			    struct sheepdog_node_list_entry *joining,
-			    void *opaque),
-		    void *opaque, size_t opaque_len);
+	int (*join)(struct sd_node *myself, void *opaque, size_t opaque_len);
 
 	/*
 	 * Leave the cluster
@@ -88,31 +84,26 @@ struct cluster_driver {
 	/*
 	 * Notify a message to all nodes in the cluster
 	 *
-	 * This function sends 'msg' to all the nodes.  The notified
-	 * messages can be read through notify_handler() in
-	 * cdrv_handlers.  If 'block_cb' is specified, block_cb() is
-	 * called before 'msg' is notified to all the nodes.  All the
-	 * cluster events including this notification are blocked
-	 * until block_cb() returns or this blocking node leaves the
-	 * cluster.  The sheep daemon can sleep in block_cb(), so this
-	 * callback must be not called from the dispatch (main) thread.
+	 * This function sends 'msg' to all the nodes.  The notified messages
+	 * can be read through sd_notify_handler().
 	 *
 	 * Returns zero on success, -1 on error
 	 */
-	int (*notify)(void *msg, size_t msg_len, void (*block_cb)(void *arg));
+	int (*notify)(void *msg, size_t msg_len);
 
 	/*
-	 * Dispatch handlers
+	 * Send a message to all nodes to block further events.
 	 *
-	 * This function dispatches handlers according to the
-	 * delivered events (join/leave/notify) in the cluster.
-	 *
-	 * Note that the events sequence is totally ordered; all nodes
-	 * call the handlers in the same sequence.
-	 *
-	 * Returns zero on success, -1 on error
+	 * Once the cluster driver has ensured that events are blocked on all
+	 * nodes it needs to call sd_block_handler() on the node where ->block
+	 * was called.
 	 */
-	int (*dispatch)(void);
+	void (*block)(void);
+
+	/*
+	 * Unblock events on all nodes, and send a a message to all nodes.
+	 */
+	void (*unblock)(void *msg, size_t msg_len);
 
 	struct list_head list;
 };
@@ -121,8 +112,7 @@ extern struct list_head cluster_drivers;
 
 #define cdrv_register(driver)						\
 static void __attribute__((constructor)) regist_ ## driver(void) {	\
-	if (!driver.init || !driver.join || !driver.leave ||		\
-	    !driver.notify || !driver.dispatch)				\
+	if (!driver.init || !driver.join || !driver.leave || !driver.notify) \
 		panic("the driver '%s' is incomplete\n", driver.name);	\
 	list_add(&driver.list, &cluster_drivers);			\
 }
@@ -157,15 +147,55 @@ static inline const char *get_cdrv_option(struct cluster_driver *cdrv,
 		return NULL;
 }
 
-static inline char *node_to_str(struct sheepdog_node_list_entry *id)
+static inline char *node_to_str(struct sd_node *id)
 {
 	static char str[256];
 	char name[256];
+	int af = AF_INET6;
+	uint8_t *addr = id->addr;
 
-	snprintf(str, sizeof(str), "ip: %s, port: %d",
-		 addr_to_str(name, sizeof(name), id->addr, 0), id->port);
+	/* Find address family type */
+	if (addr[12]) {
+		int  oct_no = 0;
+		while (!addr[oct_no] && oct_no++ < 12)
+			;
+		if (oct_no == 12)
+			af = AF_INET;
+	}
+
+	snprintf(str, sizeof(str), "%s ip:%s port:%d",
+		(af == AF_INET) ? "IPv4" : "IPv6",
+		addr_to_str(name, sizeof(name), id->addr, 0), id->port);
 
 	return str;
 }
+
+static inline struct sd_node *str_to_node(const char *str, struct sd_node *id)
+{
+	int port, af = AF_INET6;
+	char v[8], ip[256];
+
+	sscanf(str, "%s ip:%s port:%d", v, ip, &port);
+	id->port = port;
+
+	if (strcmp(v, "IPv4") == 0)
+		af = AF_INET;
+
+	if (!str_to_addr(af, ip, id->addr))
+		return NULL;
+
+	return id;
+}
+
+/* callbacks back into sheepdog from the cluster drivers */
+void sd_join_handler(struct sd_node *joined, struct sd_node *members,
+		size_t nr_members, enum cluster_join_result result,
+		void *opaque);
+void sd_leave_handler(struct sd_node *left, struct sd_node *members,
+		size_t nr_members);
+void sd_notify_handler(struct sd_node *sender, void *msg, size_t msg_len);
+void sd_block_handler(void);
+enum cluster_join_result sd_check_join_cb(struct sd_node *joining,
+		void *opaque);
 
 #endif

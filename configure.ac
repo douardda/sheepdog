@@ -66,6 +66,7 @@ if ! ${MAKE-make} --version /cannot/make/this >/dev/null 2>&1; then
 fi
 
 AC_PROG_CC
+AM_PROG_AS
 AC_PROG_INSTALL
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
@@ -86,6 +87,9 @@ AC_CHECK_HEADERS([arpa/inet.h fcntl.h limits.h netdb.h netinet/in.h stdint.h \
 		  stdlib.h string.h sys/ioctl.h sys/param.h sys/socket.h \
 		  sys/time.h syslog.h unistd.h sys/types.h getopt.h malloc.h \
 		  sys/sockio.h utmpx.h])
+
+AC_CHECK_HEADERS([urcu.h urcu/uatomic.h],,
+	AC_MSG_ERROR(liburcu 0.6.0 or later is required))
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -124,6 +128,7 @@ AC_CHECK_FUNCS([alarm alphasort atexit bzero dup2 endgrent endpwent fcntl \
 AC_CONFIG_FILES([Makefile
 		collie/Makefile
 		sheep/Makefile
+		sheepfs/Makefile
 		include/Makefile
 		script/Makefile
 		lib/Makefile
@@ -140,7 +145,7 @@ AC_CONFIG_FILES([Makefile
 cc_supports_flag() {
 	local CFLAGS="$@"
 	AC_MSG_CHECKING([whether $CC supports "$@"])
-	AC_COMPILE_IFELSE([int main(){return 0;}] ,
+	AC_COMPILE_IFELSE([AC_LANG_SOURCE([int main(){return 0;}])] ,
 			  [RC=0; AC_MSG_RESULT([yes])],
 			  [RC=1; AC_MSG_RESULT([no])])
 	return $RC
@@ -196,6 +201,22 @@ AC_ARG_WITH([initddir],
 	[  --with-initddir=DIR     : path to init script directory. ],
 	[ INITDDIR="$withval" ],
 	[ INITDDIR="$sysconfdir/init.d" ])
+
+AC_ARG_ENABLE([farm],
+	[  --enable-farm           : build farm store driver ],,
+	[ enable_farm="yes" ],)
+AM_CONDITIONAL(BUILD_FARM, test x$enable_farm = xyes)
+
+AC_ARG_ENABLE([trace],
+	[  --enable-trace           : enable trace],,
+	[ enable_trace="no" ],)
+AM_CONDITIONAL(BUILD_TRACE, test x$enable_trace = xyes)
+
+PKG_CHECK_MODULES([fuse],[fuse], HAVE_FUSE="yes", HAVE_FUSE="no")
+AC_ARG_ENABLE([sheepfs],
+	[  --enable-sheepfs         : enable sheepfs],,
+	[ enable_sheepfs=$HAVE_FUSE ],)
+AM_CONDITIONAL(BUILD_SHEEPFS, test x$enable_sheepfs = xyes)
 
 CP=cp
 OS_LDL="-ldl"
@@ -258,6 +279,31 @@ if test "x${enable_accord}" = xyes; then
 	PACKAGE_FEATURES="$PACKAGE_FEATURES accord"
 fi
 
+if test "x${enable_farm}" = xyes; then
+	AC_CHECK_LIB([crypto], [SHA1_Init],,
+		AC_MSG_ERROR(libcrypto not found))
+	AC_CHECK_HEADERS([openssl/sha.h],,
+		AC_MSG_ERROR(sha.h header missing))
+	AC_DEFINE_UNQUOTED([HAVE_FARM], 1, [have farm])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES farm"
+fi
+
+if test "x${enable_trace}" = xyes; then
+	AC_CHECK_LIB([rt], [clock_gettime],,
+		AC_MSG_ERROR(librt not found))
+	AC_DEFINE_UNQUOTED([HAVE_TRACE], 1, [have trace])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES trace"
+fi
+
+if test "x${enable_sheepfs}" = xyes; then
+	AC_CHECK_HEADERS([fuse.h],,
+		AC_MSG_ERROR(fuse.h header missing),
+		[#define _FILE_OFFSET_BITS 64])
+	AC_DEFINE_UNQUOTED([HAVE_SHEEPFS], 1, [have sheepfs])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES sheepfs"
+fi
+
+
 # extra warnings
 EXTRA_WARNINGS=""
 
@@ -311,11 +357,23 @@ else
 	WERROR_CFLAGS=""
 fi
 
+if test "x${enable_trace}" = xyes && \
+		cc_supports_flag -pg && \
+		cc_supports_flag -gstabs ; then
+	AC_MSG_NOTICE([Enabling trace (-pg -gstabs)])
+	TRACE_CFLAGS="-pg -gstabs -DENABLE_TRACE"
+	TRACE_LDFLAGS="-T$(pwd)/sheep/trace/trace.ld"
+	PACKAGE_FEATURES="$PACKAGE_FEATURES trace"
+else
+	TRACE_CFLAGS=""
+fi
+
 # final build of *FLAGS
 CFLAGS="$ENV_CFLAGS $OPT_CFLAGS $GDB_FLAGS $OS_CFLAGS \
-	$COVERAGE_CFLAGS $EXTRA_WARNINGS $WERROR_CFLAGS $NSS_CFLAGS -D_GNU_SOURCE"
+	$TRACE_CFLAGS $COVERAGE_CFLAGS $EXTRA_WARNINGS $WERROR_CFLAGS $NSS_CFLAGS \
+	-D_GNU_SOURCE"
 CPPFLAGS="$ENV_CPPFLAGS $ANSI_CPPFLAGS $OS_CPPFLAGS"
-LDFLAGS="$ENV_LDFLAGS $COVERAGE_LDFLAGS $OS_LDFLAGS"
+LDFLAGS="$ENV_LDFLAGS $COVERAGE_LDFLAGS $OS_LDFLAGS $TRACE_LDFLAGS"
 
 # substitute what we need:
 AC_SUBST([OS_DYFLAGS])
@@ -369,6 +427,7 @@ AC_MSG_RESULT([  ANSI defined CPPFLAGS    = ${ANSI_CPPFLAGS}])
 AC_MSG_RESULT([  Coverage     CFLAGS      = ${COVERAGE_CFLAGS}])
 AC_MSG_RESULT([  Coverage     LDFLAGS     = ${COVERAGE_LDFLAGS}])
 AC_MSG_RESULT([  Fatal War.   CFLAGS      = ${WERROR_CFLAGS}])
+AC_MSG_RESULT([  Trace        CFLAGS      = ${TRACE_CFLAGS}])
 AC_MSG_RESULT([  Final        CFLAGS      = ${CFLAGS}])
 AC_MSG_RESULT([  Final        CPPFLAGS    = ${CPPFLAGS}])
 AC_MSG_RESULT([  Final        LDFLAGS     = ${LDFLAGS}])

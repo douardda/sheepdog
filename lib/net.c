@@ -16,6 +16,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
@@ -70,7 +72,12 @@ int rx(struct connection *conn, enum conn_state next_state)
 	int ret;
 
 	ret = read(conn->fd, conn->rx_buf, conn->rx_length);
-	if (!ret || ret < 0) {
+	if (!ret) {
+		conn->c_rx_state = C_IO_CLOSED;
+		return 0;
+	}
+
+	if (ret < 0) {
 		if (errno != EAGAIN)
 			conn->c_rx_state = C_IO_CLOSED;
 		return 0;
@@ -148,7 +155,7 @@ int create_listen_ports(int port, int (*callback)(int fd, void *), void *data)
 
 		ret = bind(fd, res->ai_addr, res->ai_addrlen);
 		if (ret) {
-			fprintf(stderr, "failed to bind server socket: %m\n");
+			eprintf("failed to bind server socket: %m\n");
 			close(fd);
 			continue;
 		}
@@ -198,7 +205,7 @@ int connect_to(const char *name, int port)
 
 	ret = getaddrinfo(name, buf, &hints, &res0);
 	if (ret) {
-		fprintf(stderr, "failed to get address info: %m\n");
+		eprintf("failed to get address info: %m\n");
 		return -1;
 	}
 
@@ -223,7 +230,7 @@ int connect_to(const char *name, int port)
 
 		ret = connect(fd, res->ai_addr, res->ai_addrlen);
 		if (ret)
-			fprintf(stderr, "failed to connect to %s:%d: %m\n",
+			eprintf("failed to connect to %s:%d: %m\n",
 				name, port);
 		else
 			goto success;
@@ -233,6 +240,7 @@ int connect_to(const char *name, int port)
 	fd = -1;
 success:
 	freeaddrinfo(res0);
+	dprintf("%d, %s:%d\n", fd, name, port);
 	return fd;
 }
 
@@ -244,7 +252,7 @@ reread:
 	if (ret < 0 || !ret) {
 		if (errno == EINTR)
 			goto reread;
-		fprintf(stderr, "failed to read from socket: %m\n");
+		eprintf("failed to read from socket: %m\n");
 		return 1;
 	}
 
@@ -277,7 +285,7 @@ rewrite:
 	if (ret < 0) {
 		if (errno == EINTR)
 			goto rewrite;
-		fprintf(stderr, "failed to write to socket: %m\n");
+		eprintf("failed to write to socket: %m\n");
 		return 1;
 	}
 
@@ -331,7 +339,7 @@ int exec_req(int sockfd, struct sd_req *hdr, void *data,
 
 	ret = do_read(sockfd, rsp, sizeof(*rsp));
 	if (ret) {
-		fprintf(stderr, "failed to read a response: %m\n");
+		eprintf("failed to read a response: %m\n");
 		return 1;
 	}
 
@@ -341,7 +349,7 @@ int exec_req(int sockfd, struct sd_req *hdr, void *data,
 	if (*rlen) {
 		ret = do_read(sockfd, data, *rlen);
 		if (ret) {
-			fprintf(stderr, "failed to read the response data: %m\n");
+			eprintf("failed to read the response data: %m\n");
 			return 1;
 		}
 	}
@@ -370,6 +378,20 @@ char *addr_to_str(char *str, int size, uint8_t *addr, uint16_t port)
 	}
 
 	return str;
+}
+
+uint8_t *str_to_addr(int af, const char *ipstr, uint8_t *addr)
+{
+	int addr_start_idx = 0;
+
+	if (af == AF_INET)
+		addr_start_idx = 12;
+
+	memset(addr, 0, addr_start_idx);
+	if (!inet_pton(af, ipstr, addr + addr_start_idx))
+		return NULL;
+
+	return addr;
 }
 
 int set_nonblocking(int fd)
@@ -419,4 +441,47 @@ int set_timeout(int fd)
 	}
 
 	return 0;
+}
+
+int get_local_addr(uint8_t *bytes)
+{
+	struct ifaddrs *ifaddr, *ifa;
+	int ret = 0;
+
+	if (getifaddrs(&ifaddr) == -1) {
+		eprintf("getifaddrs failed: %m\n");
+		return -1;
+	}
+
+
+	for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+		struct sockaddr_in *sin;
+		struct sockaddr_in6 *sin6;
+
+		if (ifa->ifa_flags & IFF_LOOPBACK)
+			continue;
+		if (!ifa->ifa_addr)
+			continue;
+
+		switch (ifa->ifa_addr->sa_family) {
+		case AF_INET:
+			sin = (struct sockaddr_in *)ifa->ifa_addr;
+			memset(bytes, 0, 12);
+			memcpy(bytes + 12, &sin->sin_addr, 4);
+			memcpy(bytes + 12, &sin->sin_addr, 4);
+			eprintf("found IPv4 address\n");
+			goto out;
+		case AF_INET6:
+			sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+			memcpy(bytes, &sin6->sin6_addr, 16);
+			eprintf("found IPv6 address\n");
+			goto out;
+		}
+	}
+
+	eprintf("no valid interface found\n");
+	ret = -1;
+out:
+	freeifaddrs(ifaddr);
+	return ret;
 }

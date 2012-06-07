@@ -2,6 +2,9 @@
 #define __NET_H__
 
 #include <sys/socket.h>
+#include <arpa/inet.h>
+
+#include "sheepdog_proto.h"
 
 #define DEFAULT_SOCKET_TIMEOUT 5 /* seconds */
 
@@ -16,6 +19,9 @@ enum conn_state {
 struct connection {
 	int fd;
 	unsigned int events;
+
+	uint16_t port;
+	char ipstr[INET6_ADDRSTRLEN];
 
 	enum conn_state c_rx_state;
 	int rx_length;
@@ -45,8 +51,10 @@ int exec_req(int sockfd, struct sd_req *hdr, void *data,
 int create_listen_ports(int port, int (*callback)(int fd, void *), void *data);
 
 char *addr_to_str(char *str, int size, uint8_t *addr, uint16_t port);
+uint8_t *str_to_addr(int af, const char *ipstr, uint8_t *addr);
 int set_nonblocking(int fd);
 int set_nodelay(int fd);
 int set_timeout(int fd);
+int get_local_addr(uint8_t *bytes);
 
 #endif
