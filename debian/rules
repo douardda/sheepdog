@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+%:
+	dh $@ --with autoreconf
+
+override_dh_install:
+	dh_install
+	# Install bash autocompletion.
+	install -m 644 -D \
+		script/bash_completion_collie \
+		$(CURDIR)/debian/sheepdog/etc/bash_completion.d/collie
+
+

@@ -1,0 +1,21 @@
+Source: sheepdog
+Section: admin
+Priority: extra
+Maintainer: Guido Günther <agx@sigxcpu.org>
+Build-Depends: debhelper (>= 7.0.50~),
+ automake,
+ autoconf,
+ dh-autoreconf,
+ pkg-config,
+ libcorosync-dev (>= 1.4.2-3)
+Standards-Version: 3.9.3
+Homepage: http://www.osrg.net/sheepdog/
+
+Package: sheepdog
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, corosync
+Description: Distributed storage system for KVM/QEMU
+ Sheepdog provides highly available block level storage volumes that can be
+ attached to KVM/QEMU virtual machines. Sheepdog scales to several hundreds
+ nodes, and supports advanced volume management features such as snapshot,
+ cloning, and thin provisioning.
