@@ -7,7 +7,7 @@ Build-Depends: debhelper (>= 7.0.50~),
  autoconf,
  dh-autoreconf,
  pkg-config,
- libcorosync-dev
+ libcorosync-dev (>= 1.4.2-3)
 Standards-Version: 3.9.3
 Homepage: http://www.osrg.net/sheepdog/
 
