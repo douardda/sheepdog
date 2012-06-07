@@ -119,6 +119,7 @@ int trunk_init(void)
 		oid = strtoull(d->d_name, NULL, 16);
 		if (oid == 0 || oid == ULLONG_MAX)
 			continue;
+		objlist_cache_insert(oid);
 		lookup_trunk_entry(oid, 1);
 	}
 
@@ -239,11 +240,14 @@ static int oid_stale(uint64_t oid)
 	struct vnode_info *vnodes;
 	struct sd_vnode *v;
 	int ret = 1;
+	struct sd_vnode *obj_vnodes[SD_MAX_COPIES];
 
 	vnodes = get_vnode_info();
 	nr_copies = get_nr_copies(vnodes);
+
+	oid_to_vnodes(vnodes, oid, nr_copies, obj_vnodes);
 	for (i = 0; i < nr_copies; i++) {
-		v = oid_to_vnode(vnodes, oid, i);
+		v = obj_vnodes[i];
 		if (vnode_is_local(v)) {
 			ret = 0;
 			break;
@@ -394,18 +398,4 @@ void trunk_reset(void)
 	}
 	eprintf("%s\n", trunk_entry_active_nr ? "WARN: active_list not clean" :
 						"clean");
-}
-
-int trunk_get_working_objlist(uint64_t *list)
-{
-	int nr = 0;
-	struct trunk_entry_incore *entry;
-
-	pthread_mutex_lock(&active_list_lock);
-	list_for_each_entry(entry, &trunk_active_list, active_list) {
-		list[nr++] = entry->raw.oid;
-	}
-	pthread_mutex_unlock(&active_list_lock);
-
-	return nr;
 }

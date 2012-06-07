@@ -16,6 +16,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
@@ -238,6 +240,7 @@ int connect_to(const char *name, int port)
 	fd = -1;
 success:
 	freeaddrinfo(res0);
+	dprintf("%d, %s:%d\n", fd, name, port);
 	return fd;
 }
 
@@ -438,4 +441,47 @@ int set_timeout(int fd)
 	}
 
 	return 0;
+}
+
+int get_local_addr(uint8_t *bytes)
+{
+	struct ifaddrs *ifaddr, *ifa;
+	int ret = 0;
+
+	if (getifaddrs(&ifaddr) == -1) {
+		eprintf("getifaddrs failed: %m\n");
+		return -1;
+	}
+
+
+	for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+		struct sockaddr_in *sin;
+		struct sockaddr_in6 *sin6;
+
+		if (ifa->ifa_flags & IFF_LOOPBACK)
+			continue;
+		if (!ifa->ifa_addr)
+			continue;
+
+		switch (ifa->ifa_addr->sa_family) {
+		case AF_INET:
+			sin = (struct sockaddr_in *)ifa->ifa_addr;
+			memset(bytes, 0, 12);
+			memcpy(bytes + 12, &sin->sin_addr, 4);
+			memcpy(bytes + 12, &sin->sin_addr, 4);
+			eprintf("found IPv4 address\n");
+			goto out;
+		case AF_INET6:
+			sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+			memcpy(bytes, &sin6->sin6_addr, 16);
+			eprintf("found IPv6 address\n");
+			goto out;
+		}
+	}
+
+	eprintf("no valid interface found\n");
+	ret = -1;
+out:
+	freeifaddrs(ifaddr);
+	return ret;
 }

@@ -88,6 +88,9 @@ AC_CHECK_HEADERS([arpa/inet.h fcntl.h limits.h netdb.h netinet/in.h stdint.h \
 		  sys/time.h syslog.h unistd.h sys/types.h getopt.h malloc.h \
 		  sys/sockio.h utmpx.h])
 
+AC_CHECK_HEADERS([urcu.h urcu/uatomic.h],,
+	AC_MSG_ERROR(liburcu 0.6.0 or later is required))
+
 # Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
 AC_TYPE_UID_T
@@ -125,6 +128,7 @@ AC_CHECK_FUNCS([alarm alphasort atexit bzero dup2 endgrent endpwent fcntl \
 AC_CONFIG_FILES([Makefile
 		collie/Makefile
 		sheep/Makefile
+		sheepfs/Makefile
 		include/Makefile
 		script/Makefile
 		lib/Makefile
@@ -141,7 +145,7 @@ AC_CONFIG_FILES([Makefile
 cc_supports_flag() {
 	local CFLAGS="$@"
 	AC_MSG_CHECKING([whether $CC supports "$@"])
-	AC_COMPILE_IFELSE([int main(){return 0;}] ,
+	AC_COMPILE_IFELSE([AC_LANG_SOURCE([int main(){return 0;}])] ,
 			  [RC=0; AC_MSG_RESULT([yes])],
 			  [RC=1; AC_MSG_RESULT([no])])
 	return $RC
@@ -207,6 +211,12 @@ AC_ARG_ENABLE([trace],
 	[  --enable-trace           : enable trace],,
 	[ enable_trace="no" ],)
 AM_CONDITIONAL(BUILD_TRACE, test x$enable_trace = xyes)
+
+PKG_CHECK_MODULES([fuse],[fuse], HAVE_FUSE="yes", HAVE_FUSE="no")
+AC_ARG_ENABLE([sheepfs],
+	[  --enable-sheepfs         : enable sheepfs],,
+	[ enable_sheepfs=$HAVE_FUSE ],)
+AM_CONDITIONAL(BUILD_SHEEPFS, test x$enable_sheepfs = xyes)
 
 CP=cp
 OS_LDL="-ldl"
@@ -284,6 +294,15 @@ if test "x${enable_trace}" = xyes; then
 	AC_DEFINE_UNQUOTED([HAVE_TRACE], 1, [have trace])
 	PACKAGE_FEATURES="$PACKAGE_FEATURES trace"
 fi
+
+if test "x${enable_sheepfs}" = xyes; then
+	AC_CHECK_HEADERS([fuse.h],,
+		AC_MSG_ERROR(fuse.h header missing),
+		[#define _FILE_OFFSET_BITS 64])
+	AC_DEFINE_UNQUOTED([HAVE_SHEEPFS], 1, [have sheepfs])
+	PACKAGE_FEATURES="$PACKAGE_FEATURES sheepfs"
+fi
+
 
 # extra warnings
 EXTRA_WARNINGS=""

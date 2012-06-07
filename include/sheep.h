@@ -22,6 +22,7 @@
 #define SD_DEFAULT_REDUNDANCY 3
 #define SD_MAX_REDUNDANCY 8
 
+#define SD_MAX_COPIES 16
 #define SD_MAX_NODES 1024
 #define SD_DEFAULT_VNODES 64
 #define SD_MAX_VNODES 65536
@@ -46,6 +47,7 @@
 #define SD_OP_TRACE          0x95
 #define SD_OP_TRACE_CAT      0x96
 #define SD_OP_STAT_RECOVERY  0x97
+#define SD_OP_FLUSH_DEL_CACHE  0x98
 
 #define SD_FLAG_CMD_IO_LOCAL   0x0010
 #define SD_FLAG_CMD_RECOVERY 0x0020
@@ -224,26 +226,46 @@ next:
 	return idx;
 }
 
-static inline int hval_to_sheep(struct sd_vnode *entries,
-				int nr_entries, uint64_t id, int idx)
+static inline int get_vnode_pos(struct sd_vnode *entries,
+			int nr_entries, uint64_t oid)
 {
-	int i;
-	struct sd_vnode *e = entries, *n;
+	uint64_t id = fnv_64a_buf(&oid, sizeof(oid), FNV1A_64_INIT);
+	int start, end, pos;
 
-	for (i = 0; i < nr_entries - 1; i++, e++) {
-		n = e + 1;
-		if (id > e->id && id <= n->id)
-			break;
+	start = 0;
+	end = nr_entries - 1;
+
+	if (id > entries[end].id || id < entries[start].id)
+		return end;
+
+	for (;;) {
+		pos = (end - start) / 2 + start;
+		if (entries[pos].id < id) {
+			if (entries[pos + 1].id >= id)
+				return pos;
+			start = pos;
+		} else
+			end = pos;
 	}
-	return get_nth_node(entries, nr_entries, (i + 1) % nr_entries, idx);
 }
 
 static inline int obj_to_sheep(struct sd_vnode *entries,
 			       int nr_entries, uint64_t oid, int idx)
 {
-	uint64_t id = fnv_64a_buf(&oid, sizeof(oid), FNV1A_64_INIT);
+	int pos = get_vnode_pos(entries, nr_entries, oid);
 
-	return hval_to_sheep(entries, nr_entries, id, idx);
+	return get_nth_node(entries, nr_entries, (pos + 1) % nr_entries, idx);
+}
+
+static inline void obj_to_sheeps(struct sd_vnode *entries,
+		  int nr_entries, uint64_t oid, int nr_copies, int *idxs)
+{
+	int pos = get_vnode_pos(entries, nr_entries, oid);
+	int idx;
+
+	for (idx = 0; idx < nr_copies; idx++)
+		idxs[idx] = get_nth_node(entries, nr_entries,
+				(pos + 1) % nr_entries, idx);
 }
 
 static inline int is_sheep_op(uint8_t op)
@@ -304,6 +326,23 @@ static inline const char *sd_strerror(int err)
 	return "Invalid error code";
 }
 
+static inline int vnode_node_cmp(const void *a, const void *b)
+{
+	const struct sd_vnode *node1 = a;
+	const struct sd_node *node2 = b;
+	int cmp;
+
+	cmp = memcmp(node1->addr, node2->addr, sizeof(node1->addr));
+	if (cmp != 0)
+		return cmp;
+
+	if (node1->port < node2->port)
+		return -1;
+	if (node1->port > node2->port)
+		return 1;
+	return 0;
+}
+
 static inline int node_cmp(const void *a, const void *b)
 {
 	const struct sd_node *node1 = a;
@@ -319,6 +358,11 @@ static inline int node_cmp(const void *a, const void *b)
 	if (node1->port > node2->port)
 		return 1;
 	return 0;
+}
+
+static inline int node_eq(const struct sd_node *a, const struct sd_node *b)
+{
+	return node_cmp(a, b) == 0;
 }
 
 static inline int vnode_cmp(const void *a, const void *b)

@@ -26,37 +26,19 @@ struct objlist_cache_entry {
 	struct rb_node node;
 };
 
-struct objlist_cache obj_list_cache;
-
-int init_objlist_cache(void)
-{
-	int i;
-	struct siocb iocb = { 0 };
+struct objlist_cache {
+	int tree_version;
+	int buf_version;
+	int cache_size;
 	uint64_t *buf;
+	struct rb_root root;
+	pthread_rwlock_t lock;
+};
 
-	pthread_rwlock_init(&obj_list_cache.lock, NULL);
-	obj_list_cache.root = RB_ROOT;
-	obj_list_cache.cache_size = 0;
-
-	if (sd_store) {
-		buf = zalloc(1 << 22);
-		if (!buf) {
-			eprintf("no memory to allocate.\n");
-			return -1;
-		}
-
-		iocb.length = 0;
-		iocb.buf = buf;
-		sd_store->get_objlist(&iocb);
-
-		for (i = 0; i < iocb.length; i++)
-			check_and_insert_objlist_cache(buf[i]);
-
-		free(buf);
-	}
-
-	return 0;
-}
+struct objlist_cache obj_list_cache = {
+	.tree_version	= 1,
+	.root		= RB_ROOT,
+};
 
 static struct objlist_cache_entry *objlist_cache_rb_insert(struct rb_root *root,
 		struct objlist_cache_entry *new)
@@ -82,7 +64,7 @@ static struct objlist_cache_entry *objlist_cache_rb_insert(struct rb_root *root,
 	return NULL; /* insert successfully */
 }
 
-int objlist_cache_rb_remove(struct rb_root *root, uint64_t oid)
+static int objlist_cache_rb_remove(struct rb_root *root, uint64_t oid)
 {
 	struct rb_node **p = &root->rb_node;
 	struct rb_node *parent = NULL;
@@ -98,6 +80,7 @@ int objlist_cache_rb_remove(struct rb_root *root, uint64_t oid)
 			p = &(*p)->rb_right;
 		else {
 			rb_erase(parent, root);
+			free(entry);
 			return 0;
 		}
 	}
@@ -105,7 +88,17 @@ int objlist_cache_rb_remove(struct rb_root *root, uint64_t oid)
 	return -1; /* fail to remove */
 }
 
-int check_and_insert_objlist_cache(uint64_t oid)
+void objlist_cache_remove(uint64_t oid)
+{
+	pthread_rwlock_wrlock(&obj_list_cache.lock);
+	if (!objlist_cache_rb_remove(&obj_list_cache.root, oid)) {
+		obj_list_cache.cache_size--;
+		obj_list_cache.tree_version++;
+	}
+	pthread_rwlock_unlock(&obj_list_cache.lock);
+}
+
+int objlist_cache_insert(uint64_t oid)
 {
 	struct objlist_cache_entry *entry, *p;
 
@@ -123,8 +116,10 @@ int check_and_insert_objlist_cache(uint64_t oid)
 	p = objlist_cache_rb_insert(&obj_list_cache.root, entry);
 	if (p)
 		free(entry);
-	else
+	else {
 		obj_list_cache.cache_size++;
+		obj_list_cache.tree_version++;
+	}
 	pthread_rwlock_unlock(&obj_list_cache.lock);
 
 	return 0;
@@ -132,20 +127,39 @@ int check_and_insert_objlist_cache(uint64_t oid)
 
 int get_obj_list(const struct sd_list_req *hdr, struct sd_list_rsp *rsp, void *data)
 {
-	uint64_t *list = (uint64_t *)data;
 	int nr = 0;
-	int res = SD_RES_SUCCESS;
 	struct objlist_cache_entry *entry;
 	struct rb_node *p;
 
+	/* first try getting the cached buffer with only a read lock held */
 	pthread_rwlock_rdlock(&obj_list_cache.lock);
+	if (obj_list_cache.tree_version == obj_list_cache.buf_version)
+		goto out;
+
+	/* if that fails grab a write lock for the usually nessecary update */
+	pthread_rwlock_unlock(&obj_list_cache.lock);
+	pthread_rwlock_wrlock(&obj_list_cache.lock);
+	if (obj_list_cache.tree_version == obj_list_cache.buf_version)
+		goto out;
+
+	obj_list_cache.buf_version = obj_list_cache.tree_version;
+	obj_list_cache.buf = xrealloc(obj_list_cache.buf,
+				obj_list_cache.cache_size * sizeof(uint64_t));
+
 	for (p = rb_first(&obj_list_cache.root); p; p = rb_next(p)) {
 		entry = rb_entry(p, struct objlist_cache_entry, node);
-		list[nr++] = entry->oid;
+		obj_list_cache.buf[nr++] = entry->oid;
 	}
+
+out:
+	if (hdr->data_length < obj_list_cache.cache_size * sizeof(uint64_t)) {
+		pthread_rwlock_unlock(&obj_list_cache.lock);
+		eprintf("GET_OBJ_LIST buffer too small\n");
+		return SD_RES_EIO;
+	}
+
+	rsp->data_length = obj_list_cache.cache_size * sizeof(uint64_t);
+	memcpy(data, obj_list_cache.buf, rsp->data_length);
 	pthread_rwlock_unlock(&obj_list_cache.lock);
-
-	rsp->data_length = nr * sizeof(uint64_t);
-
-	return res;
+	return SD_RES_SUCCESS;
 }

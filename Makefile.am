@@ -19,6 +19,10 @@ sheepdogsysconf_DATA	=
 
 SUBDIRS			= lib collie sheep include script man tests
 
+if BUILD_SHEEPFS
+SUBDIRS			+= sheepfs
+endif
+
 install-exec-local:
 	$(INSTALL) -d $(DESTDIR)/${localstatedir}/lib/sheepdog
 
@@ -30,6 +34,7 @@ dist-clean-local:
 
 clean-generic:
 	rm -rf $(SPEC) $(TARFILE) cscope*
+	find -name '*.orig' -or -name '*.rej' | xargs rm -f
 
 cscope:
 	@echo create cscope.out

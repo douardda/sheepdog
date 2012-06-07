@@ -20,68 +20,71 @@
 
 #include "sheep_priv.h"
 
-void resume_pending_requests(void)
-{
-	struct request *next, *tmp;
-
-	list_for_each_entry_safe(next, tmp, &sys->req_wait_for_obj_list,
-				 r_wlist) {
-		struct event_struct *cevent = &next->cev;
-
-		list_del(&next->r_wlist);
-		list_add_tail(&cevent->event_list, &sys->request_queue);
-	}
-
-	if (!list_empty(&sys->request_queue))
-		process_request_event_queues();
-}
+static void requeue_request(struct request *req);
 
 static int is_access_local(struct request *req, uint64_t oid)
 {
-	struct sd_vnode *v;
+	struct sd_vnode *obj_vnodes[SD_MAX_COPIES];
 	int nr_copies;
 	int i;
 
 	nr_copies = get_nr_copies(req->vnodes);
+	oid_to_vnodes(req->vnodes, oid, nr_copies, obj_vnodes);
 
 	for (i = 0; i < nr_copies; i++) {
-		v = oid_to_vnode(req->vnodes, oid, i);
-		if (vnode_is_local(v))
+		if (vnode_is_local(obj_vnodes[i]))
 			return 1;
 	}
 
 	return 0;
 }
 
-static void setup_access_to_local_objects(struct request *req)
+static int need_consistency_check(struct request *req)
 {
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
+	struct sd_req *hdr = &req->rq;
 
-	if (hdr->flags & SD_FLAG_CMD_IO_LOCAL) {
-		req->local_oid = hdr->oid;
-		return;
-	}
+	if (hdr->opcode != SD_OP_READ_OBJ)
+		/* consistency is fixed when clients read data for the
+		 * first time */
+		return 0;
 
-	if (is_access_local(req, hdr->oid))
-		req->local_oid = hdr->oid;
+	if (hdr->flags & SD_FLAG_CMD_WEAK_CONSISTENCY)
+		return 0;
 
-	if (hdr->cow_oid)
-		if (is_access_local(req, hdr->cow_oid))
-			req->local_cow_oid = hdr->cow_oid;
+	if (is_vdi_obj(hdr->obj.oid))
+		/* only check consistency for data objects */
+		return 0;
+
+	return 1;
 }
 
-static void check_object_consistency(struct sd_obj_req *hdr)
+static inline void set_consistency_check(struct request *req)
 {
-	uint32_t vdi_id = oid_to_vid(hdr->oid);
+	uint32_t vdi_id = oid_to_vid(req->rq.obj.oid);
+	uint32_t idx = data_oid_to_idx(req->rq.obj.oid);
+	struct data_object_bmap *bmap;
+
+	req->check_consistency = 1;
+	list_for_each_entry(bmap, &sys->consistent_obj_list, list) {
+		if (bmap->vdi_id == vdi_id) {
+			if (test_bit(idx, bmap->dobjs))
+				req->check_consistency = 0;
+			break;
+		}
+	}
+}
+
+static void check_object_consistency(struct sd_req *hdr)
+{
+	uint32_t vdi_id = oid_to_vid(hdr->obj.oid);
 	struct data_object_bmap *bmap, *n;
 	int nr_bmaps = 0;
 
 	list_for_each_entry_safe(bmap, n, &sys->consistent_obj_list, list) {
 		nr_bmaps++;
 		if (bmap->vdi_id == vdi_id) {
-			set_bit(data_oid_to_idx(hdr->oid), bmap->dobjs);
-			list_del(&bmap->list);
-			list_add_tail(&bmap->list, &sys->consistent_obj_list);
+			set_bit(data_oid_to_idx(hdr->obj.oid), bmap->dobjs);
+			list_move_tail(&bmap->list, &sys->consistent_obj_list);
 			return;
 		}
 	}
@@ -96,7 +99,7 @@ static void check_object_consistency(struct sd_obj_req *hdr)
 
 	bmap->vdi_id = vdi_id;
 	list_add_tail(&bmap->list, &sys->consistent_obj_list);
-	set_bit(data_oid_to_idx(hdr->oid), bmap->dobjs);
+	set_bit(data_oid_to_idx(hdr->obj.oid), bmap->dobjs);
 	if (nr_bmaps >= MAX_DATA_OBJECT_BMAPS) {
 		/* the first entry is the least recently used one */
 		bmap = list_first_entry(&sys->consistent_obj_list,
@@ -109,54 +112,57 @@ static void check_object_consistency(struct sd_obj_req *hdr)
 static void io_op_done(struct work *work)
 {
 	struct request *req = container_of(work, struct request, work);
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
 
-	list_del(&req->r_wlist);
-	sys->nr_outstanding_io--;
+	if (req->rp.result == SD_RES_EIO) {
+		req->rp.result = SD_RES_NETWORK_ERROR;
+
+		eprintf("leaving sheepdog cluster\n");
+		leave_cluster();
+	}
+
+	req_done(req);
+	return;
+}
+
+static void gateway_op_done(struct work *work)
+{
+	struct request *req = container_of(work, struct request, work);
+	struct sd_req *hdr = &req->rq;
 
 	switch (req->rp.result) {
 	case SD_RES_OLD_NODE_VER:
+		if (req->rp.epoch > sys->epoch) {
+			list_add_tail(&req->request_list,
+				      &sys->wait_rw_queue);
+			/*
+			 * Gateway of this node is expected to process this
+			 * request later when epoch is lifted.
+			 */
+			return;
+		}
+		/*FALLTHRU*/
 	case SD_RES_NEW_NODE_VER:
 	case SD_RES_NETWORK_ERROR:
 	case SD_RES_WAIT_FOR_JOIN:
 	case SD_RES_WAIT_FOR_FORMAT:
-		if (!(req->rq.flags & SD_FLAG_CMD_IO_LOCAL))
-			goto retry;
-		break;
+		goto retry;
 	case SD_RES_EIO:
-		if (is_access_local(req, hdr->oid)) {
+		if (is_access_local(req, hdr->obj.oid)) {
 			eprintf("leaving sheepdog cluster\n");
 			leave_cluster();
-
-			if (!(req->rq.flags & SD_FLAG_CMD_IO_LOCAL))
-				goto retry;
-
-			/* hack to retry */
-			req->rp.result = SD_RES_NETWORK_ERROR;
+			goto retry;
 		}
 		break;
 	case SD_RES_SUCCESS:
-		if (req->check_consistency && is_data_obj(hdr->oid))
+		if (req->check_consistency && is_data_obj(hdr->obj.oid))
 			check_object_consistency(hdr);
 		break;
 	}
 
-	resume_pending_requests();
-	resume_recovery_work();
-
-	req->done(req);
+	req_done(req);
 	return;
-
 retry:
-	req->rq.epoch = sys->epoch;
-
-	put_vnode_info(req->vnodes);
-	req->vnodes = get_vnode_info();
-	setup_access_to_local_objects(req);
-	list_add_tail(&req->cev.event_list, &sys->request_queue);
-
-	resume_pending_requests();
-	resume_recovery_work();
+	requeue_request(req);
 }
 
 static void local_op_done(struct work *work)
@@ -168,105 +174,214 @@ static void local_op_done(struct work *work)
 						 &req->rp, req->data);
 	}
 
-	req->done(req);
-}
-
-static void cluster_op_done(struct work *work)
-{
-	/* request is forwarded to cpg group */
+	req_done(req);
 }
 
 static void do_local_request(struct work *work)
 {
 	struct request *req = container_of(work, struct request, work);
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&req->rp;
 	int ret = SD_RES_SUCCESS;
 
 	if (has_process_work(req->op))
-		ret = do_process_work(req->op, &req->rq, &req->rp, req->data);
+		ret = do_process_work(req);
 
-	rsp->result = ret;
+	req->rp.result = ret;
 }
 
-static int check_epoch(struct request *req)
+static int check_request_epoch(struct request *req)
 {
-	uint32_t req_epoch = req->rq.epoch;
-	uint32_t opcode = req->rq.opcode;
-	int ret = SD_RES_SUCCESS;
-
-	if (before(req_epoch, sys->epoch)) {
-		ret = SD_RES_OLD_NODE_VER;
+	if (before(req->rq.epoch, sys->epoch)) {
 		eprintf("old node version %u, %u, %x\n",
-				sys->epoch, req_epoch, opcode);
-	} else if (after(req_epoch, sys->epoch)) {
-		ret = SD_RES_NEW_NODE_VER;
-		eprintf("new node version %u, %u, %x\n",
-				sys->epoch, req_epoch, opcode);
-	}
-	return ret;
-}
-
-static int check_request(struct request *req)
-{
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
-
-	/*
-	 * if we go for a cached object, we don't care if it is busy
-	 * or being recovered.
-	 */
-	if ((hdr->flags & SD_FLAG_CMD_CACHE) && object_is_cached(hdr->oid))
-		return 0;
-
-	if (!req->local_oid && !req->local_cow_oid)
-		return 0;
-	else {
-		int ret = check_epoch(req);
-		if (ret != SD_RES_SUCCESS) {
-			req->rp.result = ret;
-			sys->nr_outstanding_io++;
-			req->work.done(&req->work);
-			return -1;
-		}
-	}
-
-	if (!req->local_oid)
-		return 0;
-
-	if (is_recoverying_oid(req->local_oid)) {
-		if (req->rq.flags & SD_FLAG_CMD_IO_LOCAL) {
-			/* Sheep peer request */
-			req->rp.result = SD_RES_NEW_NODE_VER;
-			sys->nr_outstanding_io++;
-			req->work.done(&req->work);
-		} else {
-			/* Gateway request */
-			list_del(&req->r_wlist);
-			list_add_tail(&req->r_wlist, &sys->req_wait_for_obj_list);
-		}
+			sys->epoch, req->rq.epoch, req->rq.opcode);
+		/* ask gateway to retry. */
+		req->rp.result = SD_RES_OLD_NODE_VER;
+		req->rp.epoch = sys->epoch;
+		req_done(req);
 		return -1;
-	}
+	} else if (after(req->rq.epoch, sys->epoch)) {
+		eprintf("new node version %u, %u, %x\n",
+			sys->epoch, req->rq.epoch, req->rq.opcode);
 
-	if (is_access_to_busy_objects(req->local_oid)) {
-		list_del(&req->r_wlist);
-		list_add_tail(&req->r_wlist, &sys->req_wait_for_obj_list);
+		/* put on local wait queue, waiting for local epoch
+		   to be lifted */
+		req->rp.result = SD_RES_NEW_NODE_VER;
+		list_add_tail(&req->request_list, &sys->wait_rw_queue);
 		return -1;
 	}
 
 	return 0;
 }
 
+static bool request_in_recovery(struct request *req)
+{
+	/*
+	 * Request from recovery should go down the Farm even if
+	 * oid_in_recovery() returns true because we should also try snap
+	 * cache of the Farm and return the error code back if not found.
+	 */
+	if (oid_in_recovery(req->local_oid) &&
+	    !(req->rq.flags & SD_FLAG_CMD_RECOVERY)) {
+		/*
+		 * Put request on wait queues of local node
+		 */
+		if (is_recovery_init()) {
+			req->rp.result = SD_RES_OBJ_RECOVERING;
+			list_add_tail(&req->request_list,
+				      &sys->wait_rw_queue);
+		} else {
+			list_add_tail(&req->request_list,
+				      &sys->wait_obj_queue);
+		}
+		return true;
+	}
+	return false;
+}
+
+void resume_wait_epoch_requests(void)
+{
+	struct request *req, *t;
+	LIST_HEAD(pending_list);
+
+	list_splice_init(&sys->wait_rw_queue, &pending_list);
+
+	list_for_each_entry_safe(req, t, &pending_list, request_list) {
+		switch (req->rp.result) {
+		case SD_RES_OLD_NODE_VER:
+			/*
+			 * Gateway retries to send the request when
+			 * its epoch changes.
+			 */
+			assert(!(req->rq.flags & SD_FLAG_CMD_IO_LOCAL));
+			req->rq.epoch = sys->epoch;
+			list_del(&req->request_list);
+			requeue_request(req);
+			break;
+		case SD_RES_NEW_NODE_VER:
+			/* Peer retries the request locally when its epoch changes. */
+			assert(req->rq.flags & SD_FLAG_CMD_IO_LOCAL);
+			list_del(&req->request_list);
+			requeue_request(req);
+			break;
+		default:
+			break;
+		}
+	}
+
+	list_splice_init(&pending_list, &sys->wait_rw_queue);
+}
+
+void resume_wait_recovery_requests(void)
+{
+	struct request *req, *t;
+	LIST_HEAD(pending_list);
+
+	list_splice_init(&sys->wait_rw_queue, &pending_list);
+
+	list_for_each_entry_safe(req, t, &pending_list, request_list) {
+		if (req->rp.result != SD_RES_OBJ_RECOVERING)
+			continue;
+
+		dprintf("resume wait oid %" PRIx64 "\n", req->local_oid);
+		list_del(&req->request_list);
+		requeue_request(req);
+	}
+
+	list_splice_init(&pending_list, &sys->wait_rw_queue);
+}
+
+void resume_wait_obj_requests(uint64_t oid)
+{
+	struct request *req, *t;
+	LIST_HEAD(pending_list);
+
+	list_splice_init(&sys->wait_obj_queue, &pending_list);
+
+	list_for_each_entry_safe(req, t, &pending_list, request_list) {
+		if (req->local_oid != oid)
+			continue;
+
+		/* the object requested by a pending request has been
+		 * recovered, notify the pending request. */
+		dprintf("retry %" PRIx64 "\n", req->local_oid);
+		list_del(&req->request_list);
+		requeue_request(req);
+	}
+	list_splice_init(&pending_list, &sys->wait_obj_queue);
+}
+
+void flush_wait_obj_requests(void)
+{
+	struct request *req, *n;
+	LIST_HEAD(pending_list);
+
+	list_splice_init(&sys->wait_obj_queue, &pending_list);
+
+	list_for_each_entry_safe(req, n, &pending_list, request_list) {
+		list_del(&req->request_list);
+		requeue_request(req);
+	}
+}
+
+static void queue_io_request(struct request *req)
+{
+	req->local_oid = req->rq.obj.oid;
+	if (req->local_oid) {
+		if (check_request_epoch(req) < 0)
+			return;
+		if (request_in_recovery(req))
+			return;
+	}
+
+	req->work.fn = do_io_request;
+	req->work.done = io_op_done;
+	queue_work(sys->io_wqueue, &req->work);
+}
+
+static void queue_gateway_request(struct request *req)
+{
+	struct sd_req *hdr = &req->rq;
+
+	if (is_access_local(req, hdr->obj.oid))
+		req->local_oid = hdr->obj.oid;
+
+	/*
+	 * If we go for a cached object, we don't care if it is being recovered
+	 */
+	if (sys->enable_write_cache &&
+	    req->rq.flags & SD_FLAG_CMD_CACHE &&
+	    object_is_cached(req->rq.obj.oid))
+		goto queue_work;
+
+	if (req->local_oid)
+		if (request_in_recovery(req))
+			return;
+
+	if (need_consistency_check(req))
+		set_consistency_check(req);
+
+queue_work:
+	req->work.fn = do_gateway_request;
+	req->work.done = gateway_op_done;
+	queue_work(sys->gateway_wqueue, &req->work);
+}
+
+static void queue_local_request(struct request *req)
+{
+	req->work.fn = do_local_request;
+	req->work.done = local_op_done;
+	queue_work(sys->io_wqueue, &req->work);
+}
+
 static void queue_request(struct request *req)
 {
-	struct event_struct *cevent = &req->cev;
-	struct sd_req *hdr = (struct sd_req *)&req->rq;
-	struct sd_rsp *rsp = (struct sd_rsp *)&req->rp;
+	struct sd_req *hdr = &req->rq;
+	struct sd_rsp *rsp = &req->rp;
 
 	req->op = get_sd_op(hdr->opcode);
 	if (!req->op) {
 		eprintf("invalid opcode %d\n", hdr->opcode);
 		rsp->result = SD_RES_INVALID_PARMS;
-		req->done(req);
-		return;
+		goto done;
 	}
 
 	dprintf("%x\n", hdr->opcode);
@@ -297,42 +412,48 @@ static void queue_request(struct request *req)
 		break;
 	}
 
-	req->vnodes = get_vnode_info();
-	if (is_io_op(req->op)) {
-		req->work.fn = do_io_request;
-		req->work.done = io_op_done;
-		setup_access_to_local_objects(req);
-		if (check_request(req) < 0)
-			return;
-	} else if (is_local_op(req->op)) {
-		req->work.fn = do_local_request;
-		req->work.done = local_op_done;
-	} else if (is_cluster_op(req->op)) {
-		req->work.fn = do_cluster_request;
-		req->work.done = cluster_op_done;
-	} else {
-		eprintf("unknown operation %d\n", hdr->opcode);
-		rsp->result = SD_RES_SYSTEM_ERROR;
-		req->done(req);
-		return;
-	}
 	/*
-	 * we set epoch for non direct requests here. Note that we
-	 * can't access to sys->epoch after calling
-	 * process_request_event_queues(that is, passing requests to work
-	 * threads).
+	 * we set epoch for non direct requests here.  Note that we need to
+	 * sample sys->epoch before passing requests to worker threads as
+	 * it can change anytime we return to processing membership change
+	 * events.
 	 */
 	if (!(hdr->flags & SD_FLAG_CMD_IO_LOCAL))
 		hdr->epoch = sys->epoch;
 
-	list_del(&req->r_wlist);
+	/*
+	 * force operations shouldn't access req->vnodes in their
+	 * process_work() and process_main() because they can be
+	 * called before we set up current_vnode_info
+	 */
+	if (!is_force_op(req->op))
+		req->vnodes = get_vnode_info();
 
-	cevent->ctype = EVENT_REQUEST;
-	list_add_tail(&cevent->event_list, &sys->request_queue);
-	process_request_event_queues();
+	if (is_io_op(req->op)) {
+		if (req->rq.flags & SD_FLAG_CMD_IO_LOCAL)
+			queue_io_request(req);
+		else
+			queue_gateway_request(req);
+	} else if (is_local_op(req->op)) {
+		queue_local_request(req);
+	} else if (is_cluster_op(req->op)) {
+		queue_cluster_request(req);
+	} else {
+		eprintf("unknown operation %d\n", hdr->opcode);
+		rsp->result = SD_RES_SYSTEM_ERROR;
+		goto done;
+	}
+
 	return;
 done:
-	req->done(req);
+	req_done(req);
+}
+
+static void requeue_request(struct request *req)
+{
+	if (req->vnodes)
+		put_vnode_info(req->vnodes);
+	queue_request(req);
 }
 
 static void client_incref(struct client_info *ci);
@@ -357,8 +478,7 @@ static struct request *alloc_request(struct client_info *ci, int data_length)
 		}
 	}
 
-	list_add(&req->r_siblings, &ci->reqs);
-	INIT_LIST_HEAD(&req->r_wlist);
+	INIT_LIST_HEAD(&req->request_list);
 
 	sys->nr_outstanding_reqs++;
 	sys->outstanding_data_size += data_length;
@@ -371,25 +491,21 @@ static void free_request(struct request *req)
 	sys->nr_outstanding_reqs--;
 	sys->outstanding_data_size -= req->data_length;
 
-	list_del(&req->r_siblings);
 	put_vnode_info(req->vnodes);
 	free(req->data);
 	free(req);
 }
 
-static void req_done(struct request *req)
+void req_done(struct request *req)
 {
-	int dead = 0;
 	struct client_info *ci = req->ci;
 
 	if (conn_tx_on(&ci->conn)) {
 		dprintf("connection seems to be dead\n");
-		dead = 1;
-	} else
-		list_add(&req->r_wlist, &ci->done_reqs);
-
-	if (dead)
 		free_request(req);
+	} else {
+		list_add(&req->request_list, &ci->done_reqs);
+	}
 
 	client_decref(ci);
 }
@@ -469,8 +585,6 @@ static void client_rx_handler(struct client_info *ci)
 	else
 		req->rp.data_length = hdr->data_length;
 
-	req->done = req_done;
-
 	dprintf("connection from: %s:%d\n", ci->conn.ipstr, ci->conn.port);
 	queue_request(req);
 }
@@ -485,8 +599,8 @@ static void init_tx_hdr(struct client_info *ci)
 
 	memset(rsp, 0, sizeof(*rsp));
 
-	req = list_first_entry(&ci->done_reqs, struct request, r_wlist);
-	list_del(&req->r_wlist);
+	req = list_first_entry(&ci->done_reqs, struct request, request_list);
+	list_del(&req->request_list);
 
 	ci->tx_req = req;
 	ci->conn.tx_length = sizeof(*rsp);
@@ -610,7 +724,6 @@ static struct client_info *create_client(int fd, struct cluster_info *cluster)
 	ci->conn.events = EPOLLIN;
 	ci->refcnt = 1;
 
-	INIT_LIST_HEAD(&ci->reqs);
 	INIT_LIST_HEAD(&ci->done_reqs);
 
 	init_rx_hdr(ci);

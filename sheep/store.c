@@ -46,221 +46,22 @@ mode_t def_fmode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
 struct store_driver *sd_store;
 LIST_HEAD(store_drivers);
 
-static int do_local_io(struct request *req, uint32_t epoch)
+int do_local_io(struct request *req, uint32_t epoch)
 {
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
+	dprintf("%x, %" PRIx64" , %u\n",
+		req->rq.opcode, req->rq.obj.oid, epoch);
 
-	hdr->epoch = epoch;
-	dprintf("%x, %" PRIx64" , %u\n", hdr->opcode, hdr->oid, epoch);
-
-	return do_process_work(req->op, &req->rq, &req->rp, req);
+	req->rq.epoch = epoch;
+	return do_process_work(req);
 }
 
-static int forward_read_obj_req(struct request *req)
-{
-	int i, fd, ret = SD_RES_SUCCESS;
-	unsigned wlen, rlen;
-	struct sd_obj_req hdr = *(struct sd_obj_req *)&req->rq;
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
-	struct sd_vnode *v;
-	uint64_t oid = hdr.oid;
-	int nr_copies;
-
-	hdr.flags |= SD_FLAG_CMD_IO_LOCAL;
-
-	if (hdr.copies)
-		nr_copies = hdr.copies;
-	else
-		nr_copies = get_nr_copies(req->vnodes);
-
-	/* TODO: we can do better; we need to check this first */
-	for (i = 0; i < nr_copies; i++) {
-		v = oid_to_vnode(req->vnodes, oid, i);
-		if (vnode_is_local(v)) {
-			ret = do_local_io(req, hdr.epoch);
-			if (ret != SD_RES_SUCCESS)
-				goto read_remote;
-			return ret;
-		}
-	}
-
-read_remote:
-	for (i = 0; i < nr_copies; i++) {
-		v = oid_to_vnode(req->vnodes, oid, i);
-		if (vnode_is_local(v))
-			continue;
-
-		fd = get_sheep_fd(v->addr, v->port, v->node_idx, hdr.epoch);
-		if (fd < 0) {
-			ret = SD_RES_NETWORK_ERROR;
-			continue;
-		}
-
-		wlen = 0;
-		rlen = hdr.data_length;
-
-		ret = exec_req(fd, (struct sd_req *)&hdr, req->data, &wlen, &rlen);
-
-		if (ret) { /* network errors */
-			del_sheep_fd(fd);
-			ret = SD_RES_NETWORK_ERROR;
-			continue;
-		} else {
-			memcpy(&req->rp, rsp, sizeof(*rsp));
-			ret = rsp->result;
-			break;
-		}
-	}
-	return ret;
-}
-
-int forward_write_obj_req(struct request *req)
-{
-	int i, fd, ret, pollret;
-	unsigned wlen;
-	char name[128];
-	struct sd_obj_req hdr = *(struct sd_obj_req *)&req->rq;
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&req->rp;
-	struct sd_vnode *v;
-	uint64_t oid = hdr.oid;
-	int nr_copies;
-	struct pollfd pfds[SD_MAX_REDUNDANCY];
-	int nr_fds, local = 0;
-
-	dprintf("%"PRIx64"\n", oid);
-
-	nr_fds = 0;
-	memset(pfds, 0, sizeof(pfds));
-	for (i = 0; i < ARRAY_SIZE(pfds); i++)
-		pfds[i].fd = -1;
-
-	hdr.flags |= SD_FLAG_CMD_IO_LOCAL;
-
-	wlen = hdr.data_length;
-
-	nr_copies = get_nr_copies(req->vnodes);
-	for (i = 0; i < nr_copies; i++) {
-		v = oid_to_vnode(req->vnodes, oid, i);
-
-		addr_to_str(name, sizeof(name), v->addr, 0);
-
-		if (vnode_is_local(v)) {
-			local = 1;
-			continue;
-		}
-
-		fd = get_sheep_fd(v->addr, v->port, v->node_idx, hdr.epoch);
-		if (fd < 0) {
-			eprintf("failed to connect to %s:%"PRIu32"\n", name, v->port);
-			ret = SD_RES_NETWORK_ERROR;
-			goto out;
-		}
-
-		ret = send_req(fd, (struct sd_req *)&hdr, req->data, &wlen);
-		if (ret) { /* network errors */
-			del_sheep_fd(fd);
-			ret = SD_RES_NETWORK_ERROR;
-			dprintf("fail %"PRIu32"\n", ret);
-			goto out;
-		}
-
-		pfds[nr_fds].fd = fd;
-		pfds[nr_fds].events = POLLIN;
-		nr_fds++;
-	}
-
-	if (local) {
-		ret = do_local_io(req, hdr.epoch);
-		rsp->result = ret;
-
-		if (nr_fds == 0) {
-			eprintf("exit %"PRIu32"\n", ret);
-			goto out;
-		}
-
-		if (rsp->result != SD_RES_SUCCESS) {
-			eprintf("fail %"PRIu32"\n", ret);
-			goto out;
-		}
-	}
-
-	ret = SD_RES_SUCCESS;
-again:
-	pollret = poll(pfds, nr_fds, DEFAULT_SOCKET_TIMEOUT * 1000);
-	if (pollret < 0) {
-		if (errno == EINTR)
-			goto again;
-
-		ret = SD_RES_EIO;
-	} else if (pollret == 0) { /* poll time out */
-		eprintf("timeout\n");
-
-		for (i = 0; i < nr_fds; i++)
-			del_sheep_fd(pfds[i].fd);
-
-		ret = SD_RES_NETWORK_ERROR;
-		goto out;
-	}
-
-	for (i = 0; i < nr_fds; i++) {
-		if (pfds[i].fd < 0)
-			break;
-
-		if (pfds[i].revents & POLLERR || pfds[i].revents & POLLHUP || pfds[i].revents & POLLNVAL) {
-			del_sheep_fd(pfds[i].fd);
-			ret = SD_RES_NETWORK_ERROR;
-			break;
-		}
-
-		if (!(pfds[i].revents & POLLIN))
-			continue;
-
-		if (do_read(pfds[i].fd, rsp, sizeof(*rsp))) {
-			eprintf("failed to read a response: %m\n");
-			del_sheep_fd(pfds[i].fd);
-			ret = SD_RES_NETWORK_ERROR;
-			break;
-		}
-
-		if (rsp->result != SD_RES_SUCCESS) {
-			eprintf("fail %"PRIu32"\n", rsp->result);
-			ret = rsp->result;
-		}
-
-		break;
-	}
-	if (i < nr_fds) {
-		nr_fds--;
-		memmove(pfds + i, pfds + i + 1, sizeof(*pfds) * (nr_fds - i));
-	}
-
-	dprintf("%"PRIx64" %"PRIu32"\n", oid, nr_fds);
-
-	if (nr_fds > 0) {
-		goto again;
-	}
-out:
-	return ret;
-}
-
-int update_epoch_store(uint32_t epoch)
-{
-	if (!strcmp(sd_store->name, "simple")) {
-		char new[1024];
-
-		snprintf(new, sizeof(new), "%s%08u/", obj_path, epoch);
-		mkdir(new, def_dmode);
-	}
-	return 0;
-}
-
-int update_epoch_log(uint32_t epoch)
+int update_epoch_log(uint32_t epoch, struct sd_node *nodes, size_t nr_nodes)
 {
 	int fd, ret, len;
 	time_t t;
 	char path[PATH_MAX];
 
-	dprintf("update epoch: %d, %d\n", epoch, sys->nr_nodes);
+	dprintf("update epoch: %d, %zd\n", epoch, nr_nodes);
 
 	snprintf(path, sizeof(path), "%s%08u", epoch_path, epoch);
 	fd = open(path, O_RDWR | O_CREAT | O_DSYNC, def_fmode);
@@ -269,8 +70,8 @@ int update_epoch_log(uint32_t epoch)
 		goto err_open;
 	}
 
-	len = sys->nr_nodes * sizeof(struct sd_node);
-	ret = write(fd, (char *)sys->nodes, len);
+	len = nr_nodes * sizeof(struct sd_node);
+	ret = write(fd, (char *)nodes, len);
 	if (ret != len)
 		goto err;
 
@@ -289,174 +90,51 @@ err_open:
 	return -1;
 }
 
-static int fix_object_consistency(struct request *req)
-{
-	int ret = SD_RES_NO_MEM;
-	unsigned int data_length;
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
-	struct sd_obj_req req_bak = *((struct sd_obj_req *)&req->rq);
-	struct sd_obj_rsp rsp_bak = *((struct sd_obj_rsp *)&req->rp);
-	void *data = req->data, *buf;
-	uint64_t oid = hdr->oid;
-	int old_opcode = hdr->opcode;
-
-	if (is_vdi_obj(hdr->oid))
-		data_length = SD_INODE_SIZE;
-	else if (is_vdi_attr_obj(hdr->oid))
-		data_length = SD_ATTR_OBJ_SIZE;
-	else
-		data_length = SD_DATA_OBJ_SIZE;
-
-	buf = valloc(data_length);
-	if (buf == NULL) {
-		eprintf("failed to allocate memory\n");
-		goto out;
-	}
-	memset(buf, 0, data_length);
-
-	req->data = buf;
-	hdr->offset = 0;
-	hdr->data_length = data_length;
-	hdr->opcode = SD_OP_READ_OBJ;
-	hdr->flags = 0;
-	req->op = get_sd_op(SD_OP_READ_OBJ);
-	ret = forward_read_obj_req(req);
-	if (ret != SD_RES_SUCCESS) {
-		eprintf("failed to read object %x\n", ret);
-		goto out;
-	}
-
-	hdr->opcode = SD_OP_CREATE_AND_WRITE_OBJ;
-	hdr->flags = SD_FLAG_CMD_WRITE;
-	hdr->oid = oid;
-	req->op = get_sd_op(hdr->opcode);
-	ret = forward_write_obj_req(req);
-	if (ret != SD_RES_SUCCESS) {
-		eprintf("failed to write object %x\n", ret);
-		goto out;
-	}
-out:
-	free(buf);
-	req->data = data;
-	req->op = get_sd_op(old_opcode);
-	*((struct sd_obj_req *)&req->rq) = req_bak;
-	*((struct sd_obj_rsp *)&req->rp) = rsp_bak;
-
-	return ret;
-}
-
-static int handle_gateway_request(struct request *req)
-{
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
-	uint64_t oid = hdr->oid;
-	uint32_t vid = oid_to_vid(oid);
-	uint32_t idx = data_oid_to_idx(oid);
-	struct object_cache *cache;
-	int ret, create = 0;
-
-	if (is_vdi_obj(oid))
-		idx |= 1 << CACHE_VDI_SHIFT;
-
-	cache = find_object_cache(vid, 1);
-
-	if (hdr->opcode == SD_OP_CREATE_AND_WRITE_OBJ)
-		create = 1;
-
-	if (object_cache_lookup(cache, idx, create) < 0) {
-		ret = object_cache_pull(cache, idx);
-		if (ret != SD_RES_SUCCESS)
-			return ret;
-	}
-	return object_cache_rw(cache, idx, req);
-}
-
-static int bypass_object_cache(struct sd_obj_req *hdr)
-{
-	uint64_t oid = hdr->oid;
-
-	if (!(hdr->flags & SD_FLAG_CMD_CACHE)) {
-		uint32_t vid = oid_to_vid(oid);
-		struct object_cache *cache;
-
-		cache = find_object_cache(vid, 0);
-		if (!cache)
-			return 1;
-		if (hdr->flags & SD_FLAG_CMD_WRITE) {
-			object_cache_flush_and_delete(cache);
-			return 1;
-		} else  {
-			/* For read requet, we can read cache if any */
-			uint32_t idx = data_oid_to_idx(oid);
-			if (is_vdi_obj(oid))
-				idx |= 1 << CACHE_VDI_SHIFT;
-
-			if (object_cache_lookup(cache, idx, 0) < 0)
-				return 1;
-			else
-				return 0;
-		}
-	}
-
-	/*
-	 * For vmstate && vdi_attr object, we don't do caching
-	 */
-	if (is_vmstate_obj(oid) || is_vdi_attr_obj(oid) ||
-	    hdr->flags & SD_FLAG_CMD_COW)
-		return 1;
-	return 0;
-}
-
 void do_io_request(struct work *work)
 {
 	struct request *req = container_of(work, struct request, work);
-	int ret = SD_RES_SUCCESS;
-	struct sd_obj_req *hdr = (struct sd_obj_req *)&req->rq;
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&req->rp;
-	uint64_t oid = hdr->oid;
-	uint32_t opcode = hdr->opcode;
-	uint32_t epoch = hdr->epoch;
+	uint32_t epoch;
+	int ret;
 
-	dprintf("%x, %" PRIx64" , %u\n", opcode, oid, epoch);
+	if (req->rq.flags & SD_FLAG_CMD_RECOVERY)
+		epoch = req->rq.obj.tgt_epoch;
+	else
+		epoch = req->rq.epoch;
 
-	if (hdr->flags & SD_FLAG_CMD_RECOVERY)
-		epoch = hdr->tgt_epoch;
+	dprintf("%x, %" PRIx64" , %u\n",
+		req->rq.opcode, req->rq.obj.oid, epoch);
 
-	if (hdr->flags & SD_FLAG_CMD_IO_LOCAL) {
-		ret = do_local_io(req, epoch);
-	} else {
-		if (bypass_object_cache(hdr)) {
-			/* fix object consistency when we read the object for the first time */
-			if (req->check_consistency) {
-				ret = fix_object_consistency(req);
-				if (ret != SD_RES_SUCCESS)
-					goto out;
-			}
-			if (hdr->flags & SD_FLAG_CMD_WRITE)
-				ret = forward_write_obj_req(req);
-			else
-				ret = forward_read_obj_req(req);
-		} else
-			ret = handle_gateway_request(req);
-	}
-out:
+	ret = do_local_io(req, epoch);
+
 	if (ret != SD_RES_SUCCESS)
 		dprintf("failed: %x, %" PRIx64" , %u, %"PRIx32"\n",
-			opcode, oid, epoch, ret);
-	rsp->result = ret;
+			req->rq.opcode, req->rq.obj.oid, epoch, ret);
+	req->rp.result = ret;
 }
 
 int epoch_log_read_remote(uint32_t epoch, char *buf, int len)
 {
-	struct sd_obj_req hdr;
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
-	int fd, i, ret;
-	unsigned int rlen, wlen, nr, le = get_latest_epoch();
-	char host[128];
+	int i, ret;
+	unsigned int nr, le;
 	struct sd_node nodes[SD_MAX_NODES];
 
+	le = get_latest_epoch();
+	if (!le)
+		return 0;
+
 	nr = epoch_log_read(le, (char *)nodes, sizeof(nodes));
+	if (nr < 0)
+		return -1;
+
 	nr /= sizeof(nodes[0]);
+
 	for (i = 0; i < nr; i++) {
+		struct sd_req hdr;
+		struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
+		char host[128];
+		unsigned int rlen, wlen;
+		int fd;
+
 		if (is_myself(nodes[i].addr, nodes[i].port))
 			continue;
 
@@ -469,24 +147,23 @@ int epoch_log_read_remote(uint32_t epoch, char *buf, int len)
 
 		memset(&hdr, 0, sizeof(hdr));
 		hdr.opcode = SD_OP_GET_EPOCH;
-		hdr.tgt_epoch = epoch;
-		hdr.data_length = len;
-		rlen = hdr.data_length;
+		hdr.data_length = rlen = len;
+		hdr.obj.tgt_epoch = epoch;
+
 		wlen = 0;
 
-		ret = exec_req(fd, (struct sd_req *)&hdr, buf, &wlen, &rlen);
+		ret = exec_req(fd, &hdr, buf, &wlen, &rlen);
 		close(fd);
 
-		if (ret)
-			continue;
-		if (rsp->result == SD_RES_SUCCESS) {
-			ret = rsp->data_length;
-			goto out;
-		}
+		if (!ret && rsp->result == SD_RES_SUCCESS)
+			return rsp->data_length;
 	}
-	ret = 0; /* If no one has targeted epoch file, we can safely return 0 */
-out:
-	return ret;
+
+	/*
+	 * If no node has targeted epoch log, return 0 here to at least
+	 * allow reading older epoch logs.
+	 */
+	return 0;
 }
 
 int epoch_log_read_nr(uint32_t epoch, char *buf, int len)
@@ -541,51 +218,6 @@ uint32_t get_latest_epoch(void)
 	closedir(dir);
 
 	return epoch;
-}
-
-/* remove directory recursively */
-int rmdir_r(char *dir_path)
-{
-	int ret;
-	struct stat s;
-	DIR *dir;
-	struct dirent *d;
-	char path[PATH_MAX];
-
-	dir = opendir(dir_path);
-	if (!dir) {
-		if (errno != ENOENT)
-			eprintf("failed to open %s: %m\n", dir_path);
-		return -errno;
-	}
-
-	while ((d = readdir(dir))) {
-		if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
-			continue;
-
-		snprintf(path, sizeof(path), "%s/%s", dir_path, d->d_name);
-		ret = stat(path, &s);
-		if (ret) {
-			eprintf("failed to stat %s: %m\n", path);
-			goto out;
-		}
-		if (S_ISDIR(s.st_mode))
-			ret = rmdir_r(path);
-		else
-			ret = unlink(path);
-
-		if (ret != 0) {
-			eprintf("failed to remove %s %s: %m\n",
-				S_ISDIR(s.st_mode) ? "directory" : "file",
-				path);
-			goto out;
-		}
-	}
-
-	ret = rmdir(dir_path);
-out:
-	closedir(dir);
-	return ret;
 }
 
 int set_cluster_ctime(uint64_t ct)
@@ -667,11 +299,50 @@ again:
 	return 0;
 }
 
+#define LOCK_PATH "/lock"
+
+static int lock_base_dir(const char *d)
+{
+	char *lock_path;
+	int ret = 0;
+	int fd;
+
+	lock_path = zalloc(strlen(d) + strlen(LOCK_PATH) + 1);
+	sprintf(lock_path, "%s" LOCK_PATH, d);
+
+	fd = open(lock_path, O_WRONLY|O_CREAT, def_fmode);
+	if (fd < 0) {
+		eprintf("failed to open lock file %s (%s)\n",
+			lock_path, strerror(errno));
+		ret = -1;
+		goto out;
+	}
+
+	if (lockf(fd, F_TLOCK, 1) < 0) {
+		if (errno == EACCES || errno == EAGAIN) {
+			eprintf("another sheep daemon is using %s\n", d);
+		} else {
+			eprintf("unable to get base dir lock (%s)\n",
+				strerror(errno));
+		}
+		ret = -1;
+		goto out;
+	}
+
+out:
+	free(lock_path);
+	return ret;
+}
+
 int init_base_path(const char *d)
 {
 	int new = 0;
+	int ret;
 
-	return init_path(d, &new);
+	ret = init_path(d, &new);
+	if (ret)
+		return ret;
+	return lock_base_dir(d);
 }
 
 #define OBJ_PATH "/obj/"
@@ -810,7 +481,7 @@ static int init_store_driver(void)
 	return sd_store->init(obj_path);
 }
 
-int init_store(const char *d)
+int init_store(const char *d, int enable_write_cache)
 {
 	int ret;
 
@@ -838,13 +509,13 @@ int init_store(const char *d)
 	if (ret)
 		return ret;
 
-	ret = init_objlist_cache();
-	if (ret)
-		return ret;
+	if (enable_write_cache) {
+		sys->enable_write_cache = 1;
+		ret = object_cache_init(d);
+		if (ret)
+			return 1;
+	}
 
-	ret = object_cache_init(d);
-	if (ret)
-		return 1;
 	return ret;
 }
 
@@ -868,221 +539,123 @@ int read_epoch(uint32_t *epoch, uint64_t *ct,
 	return SD_RES_SUCCESS;
 }
 
-static int write_object_local(uint64_t oid, char *data, unsigned int datalen,
-			      uint64_t offset, uint16_t flags, int copies,
-			      uint32_t epoch, int create)
-{
-	int ret;
-	struct request *req;
-	struct sd_obj_req *hdr;
-
-	req = zalloc(sizeof(*req));
-	if (!req)
-		return SD_RES_NO_MEM;
-	hdr = (struct sd_obj_req *)&req->rq;
-
-	hdr->oid = oid;
-	if (create)
-		hdr->opcode = SD_OP_CREATE_AND_WRITE_OBJ;
-	else
-		hdr->opcode = SD_OP_WRITE_OBJ;
-	hdr->copies = copies;
-	hdr->flags = flags | SD_FLAG_CMD_WRITE;
-	hdr->offset = offset;
-	hdr->data_length = datalen;
-	req->data = data;
-	req->op = get_sd_op(hdr->opcode);
-
-	ret = do_local_io(req, epoch);
-
-	free(req);
-
-	return ret;
-}
-int write_object(struct vnode_info *vnodes, uint32_t node_version,
+/*
+ * Write data to both local object cache (if enabled) and backends
+ */
+int write_object(struct vnode_info *vnodes, uint32_t epoch,
 		 uint64_t oid, char *data, unsigned int datalen,
 		 uint64_t offset, uint16_t flags, int nr_copies, int create)
 {
-	struct sd_obj_req hdr;
-	struct sd_vnode *v;
-	int i, fd, ret;
-	char name[128];
+	struct request write_req;
+	struct sd_req *hdr = &write_req.rq;
+	int ret;
 
-	for (i = 0; i < nr_copies; i++) {
-		unsigned rlen = 0, wlen = datalen;
-
-		v = oid_to_vnode(vnodes, oid, i);
-		if (vnode_is_local(v)) {
-			ret = write_object_local(oid, data, datalen, offset,
-						 flags, nr_copies, node_version,
-						 create);
-
-			if (ret != 0) {
-				eprintf("fail %"PRIx64" %"PRIx32"\n", oid, ret);
-				return -1;
-			}
-
-			continue;
-		}
-
-		addr_to_str(name, sizeof(name), v->addr, 0);
-
-		fd = connect_to(name, v->port);
-		if (fd < 0) {
-			eprintf("failed to connect to host %s\n", name);
-			return -1;
-		}
-
-		memset(&hdr, 0, sizeof(hdr));
-		hdr.epoch = node_version;
-		if (create)
-			hdr.opcode = SD_OP_CREATE_AND_WRITE_OBJ;
-		else
-			hdr.opcode = SD_OP_WRITE_OBJ;
-
-		hdr.oid = oid;
-		hdr.copies = nr_copies;
-
-		hdr.flags = flags;
-		hdr.flags |= SD_FLAG_CMD_WRITE | SD_FLAG_CMD_IO_LOCAL;
-		hdr.data_length = wlen;
-		hdr.offset = offset;
-
-		ret = exec_req(fd, (struct sd_req *)&hdr, data, &wlen, &rlen);
-		close(fd);
-		if (ret) {
-			eprintf("failed to update host %s\n", name);
-			return -1;
+	if (sys->enable_write_cache && object_is_cached(oid)) {
+		ret = object_cache_write(oid, data, datalen, offset,
+			flags, nr_copies, epoch, create);
+		if (ret != 0) {
+			eprintf("write cache failed %"PRIx64" %"PRIx32"\n",
+				oid, ret);
+			return ret;
 		}
 	}
 
-	return 0;
-}
-
-static int read_object_local(uint64_t oid, char *data, unsigned int datalen,
-			     uint64_t offset, int copies, uint32_t epoch)
-{
-	int ret;
-	struct request *req;
-	struct sd_obj_req *hdr;
-
-	req = zalloc(sizeof(*req));
-	if (!req)
-		return SD_RES_NO_MEM;
-	hdr = (struct sd_obj_req *)&req->rq;
-
-	hdr->oid = oid;
-	hdr->opcode = SD_OP_READ_OBJ;
-	hdr->copies = copies;
-	hdr->flags = 0;
-	hdr->offset = offset;
+	memset(&write_req, 0, sizeof(write_req));
+	hdr->opcode = create ? SD_OP_CREATE_AND_WRITE_OBJ : SD_OP_WRITE_OBJ;
+	hdr->flags = SD_FLAG_CMD_WRITE;
 	hdr->data_length = datalen;
-	req->data = data;
-	req->op = get_sd_op(hdr->opcode);
+	hdr->epoch = epoch;
 
-	ret = do_local_io(req, epoch);
+	hdr->obj.oid = oid;
+	hdr->obj.offset = offset;
+	hdr->obj.copies = nr_copies;
 
-	free(req);
+	write_req.data = data;
+	write_req.op = get_sd_op(hdr->opcode);
+	write_req.vnodes = vnodes;
+
+	ret = forward_write_obj_req(&write_req);
+	if (ret != SD_RES_SUCCESS)
+		eprintf("failed to forward write object %x\n", ret);
 	return ret;
 }
-int read_object(struct vnode_info *vnodes, uint32_t node_version,
+
+/*
+ * Read data firstly from local object cache(if enabled), if fail,
+ * try read backends
+ */
+int read_object(struct vnode_info *vnodes, uint32_t epoch,
 		uint64_t oid, char *data, unsigned int datalen,
 		uint64_t offset, int nr_copies)
 {
-	struct sd_obj_req hdr;
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
-	struct sd_vnode *v;
-	char name[128];
-	int i = 0, fd, ret, last_error = SD_RES_SUCCESS;
+	struct request read_req;
+	struct sd_req *hdr = &read_req.rq;
+	int ret;
 
-	/* search a local object first */
-	for (i = 0; i < nr_copies; i++) {
-		v = oid_to_vnode(vnodes, oid, i);
-		if (vnode_is_local(v)) {
-			ret = read_object_local(oid, data, datalen, offset,
-						nr_copies, node_version);
-
-			if (ret != SD_RES_SUCCESS) {
-				eprintf("fail %"PRIx64" %"PRId32"\n", oid, ret);
-				return ret;
-			}
-
-			return SD_RES_SUCCESS;
+	if (sys->enable_write_cache && object_is_cached(oid)) {
+		ret = object_cache_read(oid, data, datalen, offset,
+					nr_copies, epoch);
+		if (ret != SD_RES_SUCCESS) {
+			eprintf("try forward read %"PRIx64" %"PRIx32"\n",
+				oid, ret);
+			goto forward_read;
 		}
-
+		return ret;
 	}
+	memset(&read_req, 0, sizeof(read_req));
+forward_read:
+	hdr->opcode = SD_OP_READ_OBJ;
+	hdr->data_length = datalen;
+	hdr->epoch = epoch;
 
-	for (i = 0; i < nr_copies; i++) {
-		unsigned wlen = 0, rlen = datalen;
+	hdr->obj.oid = oid;
+	hdr->obj.offset = offset;
+	hdr->obj.copies = nr_copies;
 
-		v = oid_to_vnode(vnodes, oid, i);
+	read_req.data = data;
+	read_req.op = get_sd_op(hdr->opcode);
+	read_req.vnodes = vnodes;
 
-		addr_to_str(name, sizeof(name), v->addr, 0);
+	ret = forward_read_obj_req(&read_req);
+	if (ret != SD_RES_SUCCESS)
+		eprintf("failed to forward read object %x\n", ret);
 
-		fd = connect_to(name, v->port);
-		if (fd < 0) {
-			printf("%s(%d): %s, %m\n", __func__, __LINE__,
-			       name);
-			return SD_RES_EIO;
-		}
-
-		memset(&hdr, 0, sizeof(hdr));
-		hdr.epoch = node_version;
-		hdr.opcode = SD_OP_READ_OBJ;
-		hdr.oid = oid;
-
-		hdr.flags =  SD_FLAG_CMD_IO_LOCAL;
-		hdr.data_length = rlen;
-		hdr.offset = offset;
-
-		ret = exec_req(fd, (struct sd_req *)&hdr, data, &wlen, &rlen);
-		close(fd);
-
-		if (ret) {
-			last_error = SD_RES_EIO;
-			continue;
-		}
-
-		if (rsp->result == SD_RES_SUCCESS)
-			return SD_RES_SUCCESS;
-
-		last_error = rsp->result;
-	}
-
-	return last_error;
+	return ret;
 }
 
-int remove_object(struct vnode_info *vnodes, uint32_t node_version,
+int remove_object(struct vnode_info *vnodes, uint32_t epoch,
 		  uint64_t oid, int nr)
 {
-	char name[128];
-	struct sd_obj_req hdr;
-	struct sd_obj_rsp *rsp = (struct sd_obj_rsp *)&hdr;
-	struct sd_vnode *v;
-	int i = 0, fd, ret, err = 0;
+	struct sd_vnode *obj_vnodes[SD_MAX_COPIES];
+	int err = 0, i = 0;
 
+	oid_to_vnodes(vnodes, oid, nr, obj_vnodes);
 	for (i = 0; i < nr; i++) {
+		struct sd_req hdr;
+		struct sd_rsp *rsp = (struct sd_rsp *)&hdr;
+		struct sd_vnode *v;
 		unsigned wlen = 0, rlen = 0;
+		char name[128];
+		int fd, ret;
 
-		v = oid_to_vnode(vnodes, oid, i);
-
+		v = obj_vnodes[i];
 		addr_to_str(name, sizeof(name), v->addr, 0);
 
 		fd = connect_to(name, v->port);
 		if (fd < 0) {
-			rsp->result = SD_RES_EIO;
+			rsp->result = SD_RES_NETWORK_ERROR;
 			return -1;
 		}
 
 		memset(&hdr, 0, sizeof(hdr));
-		hdr.epoch = node_version;
+		hdr.epoch = epoch;
 		hdr.opcode = SD_OP_REMOVE_OBJ;
-		hdr.oid = oid;
-
 		hdr.flags = 0;
 		hdr.data_length = rlen;
 
-		ret = exec_req(fd, (struct sd_req *)&hdr, NULL, &wlen, &rlen);
+		hdr.obj.oid = oid;
+
+		ret = exec_req(fd, &hdr, NULL, &wlen, &rlen);
 		close(fd);
 
 		if (ret)

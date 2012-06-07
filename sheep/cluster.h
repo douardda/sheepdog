@@ -22,6 +22,9 @@
 #include "sheep.h"
 #include "logger.h"
 
+/* maximum payload size sent in ->notify and ->unblock */
+#define SD_MAX_EVENT_BUF_SIZE (64 * 1024)
+
 enum cluster_join_result {
 	CJ_RES_SUCCESS, /* Success */
 	CJ_RES_FAIL, /* Fail to join.  The joining node has an invalidepoch. */
@@ -38,11 +41,19 @@ struct cluster_driver {
 	/*
 	 * Initialize the cluster driver
 	 *
-	 * On success, this function returns the file descriptor that
-	 * may be used with the poll(2) to monitor cluster events.  On
-	 * error, returns -1.
+	 * Returns zero on success, -1 on error.
 	 */
-	int (*init)(const char *option, uint8_t *myaddr);
+	int (*init)(const char *option);
+
+	/*
+	 * Get a node ID for this sheep.
+	 *
+	 * Gets and ID that is used in all communication with other sheep,
+	 * which normally would be a string formatted IP address.
+	 *
+	 * Returns zero on success, -1 on error.
+	 */
+	int (*get_local_addr)(uint8_t *myaddr);
 
 	/*
 	 * Join the cluster
@@ -76,28 +87,23 @@ struct cluster_driver {
 	 * This function sends 'msg' to all the nodes.  The notified messages
 	 * can be read through sd_notify_handler().
 	 *
-	 * If 'block_cb' is specified, block_cb() is called before 'msg' is
-	 * notified to all the nodes.  All the cluster events including this
-	 * notification are blocked until block_cb() returns or this blocking
-	 * node leaves the cluster.  The sheep daemon can sleep in block_cb(),
-	 * so this callback must be not called from the dispatch (main) thread.
-	 *
 	 * Returns zero on success, -1 on error
 	 */
-	int (*notify)(void *msg, size_t msg_len, void (*block_cb)(void *arg));
+	int (*notify)(void *msg, size_t msg_len);
 
 	/*
-	 * Dispatch handlers
+	 * Send a message to all nodes to block further events.
 	 *
-	 * This function dispatches handlers according to the
-	 * delivered events (join/leave/notify) in the cluster.
-	 *
-	 * Note that the events sequence is totally ordered; all nodes
-	 * call the handlers in the same sequence.
-	 *
-	 * Returns zero on success, -1 on error
+	 * Once the cluster driver has ensured that events are blocked on all
+	 * nodes it needs to call sd_block_handler() on the node where ->block
+	 * was called.
 	 */
-	int (*dispatch)(void);
+	void (*block)(void);
+
+	/*
+	 * Unblock events on all nodes, and send a a message to all nodes.
+	 */
+	void (*unblock)(void *msg, size_t msg_len);
 
 	struct list_head list;
 };
@@ -106,8 +112,7 @@ extern struct list_head cluster_drivers;
 
 #define cdrv_register(driver)						\
 static void __attribute__((constructor)) regist_ ## driver(void) {	\
-	if (!driver.init || !driver.join || !driver.leave ||		\
-	    !driver.notify || !driver.dispatch)				\
+	if (!driver.init || !driver.join || !driver.leave || !driver.notify) \
 		panic("the driver '%s' is incomplete\n", driver.name);	\
 	list_add(&driver.list, &cluster_drivers);			\
 }
@@ -189,6 +194,7 @@ void sd_join_handler(struct sd_node *joined, struct sd_node *members,
 void sd_leave_handler(struct sd_node *left, struct sd_node *members,
 		size_t nr_members);
 void sd_notify_handler(struct sd_node *sender, void *msg, size_t msg_len);
+void sd_block_handler(void);
 enum cluster_join_result sd_check_join_cb(struct sd_node *joining,
 		void *opaque);
 

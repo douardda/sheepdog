@@ -12,6 +12,8 @@
 #define __SHEEP_PRIV_H__
 
 #include <inttypes.h>
+#include <stdbool.h>
+#include <urcu/uatomic.h>
 
 #include "sheepdog_proto.h"
 #include "event.h"
@@ -21,6 +23,7 @@
 #include "sheep.h"
 #include "cluster.h"
 #include "rbtree.h"
+#include "strbuf.h"
 
 #define SD_OP_GET_OBJ_LIST   0xA1
 #define SD_OP_GET_EPOCH      0XA2
@@ -34,20 +37,6 @@
 
 #define SD_RES_NETWORK_ERROR    0x81 /* Network error between sheep */
 
-enum event_type {
-	EVENT_JOIN,
-	EVENT_LEAVE,
-	EVENT_NOTIFY,
-	EVENT_REQUEST,
-};
-
-#define is_membership_change_event(x) \
-	((x) == EVENT_JOIN || (x) == EVENT_LEAVE)
-
-struct event_struct {
-	enum event_type ctype;
-	struct list_head event_list;
-};
 
 struct client_info {
 	struct connection conn;
@@ -56,19 +45,23 @@ struct client_info {
 
 	struct request *tx_req;
 
-	struct list_head reqs;
 	struct list_head done_reqs;
 
 	int refcnt;
 };
 
-struct request;
-struct vnode_info;
+struct vnode_info {
+	struct sd_vnode vnodes[SD_MAX_VNODES];
+	int nr_vnodes;
 
-typedef void (*req_end_t) (struct request *);
+	struct sd_node nodes[SD_MAX_NODES];
+	int nr_nodes;
+
+	int nr_zones;
+	int refcnt;
+};
 
 struct request {
-	struct event_struct cev;
 	struct sd_req rq;
 	struct sd_rsp rp;
 
@@ -78,17 +71,14 @@ struct request {
 	unsigned int data_length;
 
 	struct client_info *ci;
-	struct list_head r_siblings;
-	struct list_head r_wlist;
+	struct list_head request_list;
 	struct list_head pending_list;
 
 	uint64_t local_oid;
-	uint64_t local_cow_oid;
 
 	struct vnode_info *vnodes;
 	int check_consistency;
 
-	req_end_t done;
 	struct work work;
 };
 
@@ -107,6 +97,8 @@ struct cluster_info {
 	struct cluster_driver *cdrv;
 	const char *cdrv_option;
 
+	int enable_write_cache;
+
 	/* set after finishing the JOIN procedure */
 	int join_finished;
 	struct sd_node this_node;
@@ -123,25 +115,17 @@ struct cluster_info {
 	struct sd_node nodes[SD_MAX_NODES];
 	int nr_nodes;
 
-	/* this array contains a list of ordered virtual nodes */
-	struct sd_vnode vnodes[SD_MAX_VNODES];
-	int nr_vnodes;
-
 	struct list_head pending_list;
 
 	DECLARE_BITMAP(vdi_inuse, SD_NR_VDIS);
 
-	struct list_head outstanding_req_list;
-	struct list_head req_wait_for_obj_list;
 	struct list_head consistent_obj_list;
 	struct list_head blocking_conn_list;
 
 	int nr_copies;
 
-	struct list_head request_queue;
-	struct list_head event_queue;
-	struct event_struct *cur_cevent;
-	int nr_outstanding_io;
+	struct list_head wait_rw_queue;
+	struct list_head wait_obj_queue;
 	int nr_outstanding_reqs;
 	unsigned int outstanding_data_size;
 
@@ -150,16 +134,15 @@ struct cluster_info {
 	int use_directio;
 	uint8_t async_flush;
 
-	struct work_queue *event_wqueue;
 	struct work_queue *gateway_wqueue;
 	struct work_queue *io_wqueue;
 	struct work_queue *deletion_wqueue;
 	struct work_queue *recovery_wqueue;
 	struct work_queue *flush_wqueue;
+	struct work_queue *block_wqueue;
 };
 
 struct siocb {
-	int fd;
 	uint16_t flags;
 	uint32_t epoch;
 	void *buf;
@@ -171,17 +154,16 @@ struct store_driver {
 	struct list_head list;
 	const char *name;
 	int (*init)(char *path);
-	int (*open)(uint64_t oid, struct siocb *, int create);
-	int (*write)(uint64_t oid, struct siocb *);
+	int (*exist)(uint64_t oid);
+	int (*write)(uint64_t oid, struct siocb *, int create);
 	int (*read)(uint64_t oid, struct siocb *);
-	int (*close)(uint64_t oid, struct siocb *);
 	int (*format)(struct siocb *);
 	/* Operations in recovery */
-	int (*get_objlist)(struct siocb *);
 	int (*link)(uint64_t oid, struct siocb *, uint32_t tgt_epoch);
 	int (*atomic_put)(uint64_t oid, struct siocb *);
 	int (*begin_recover)(struct siocb *);
 	int (*end_recover)(struct siocb *);
+	int (*purge_obj)(void);
 	/* Operations for snapshot */
 	int (*snapshot)(struct siocb *);
 	int (*cleanup)(struct siocb *);
@@ -206,12 +188,6 @@ static inline struct store_driver *find_store_driver(const char *name)
 	return NULL;
 }
 
-struct objlist_cache {
-	struct rb_root root;
-	int cache_size;
-	pthread_rwlock_t lock;
-};
-
 extern struct cluster_info *sys;
 extern struct store_driver *sd_store;
 extern char *obj_path;
@@ -220,54 +196,73 @@ extern char *jrnl_path;
 extern char *epoch_path;
 extern mode_t def_fmode;
 extern mode_t def_dmode;
-extern struct objlist_cache obj_list_cache;
+
+/* One should call this function to get sys->epoch outside main thread */
+static inline uint32_t sys_epoch(void)
+{
+	return uatomic_read(&sys->epoch);
+}
 
 int create_listen_port(int port, void *data);
 
-int init_store(const char *dir);
+int init_store(const char *dir, int enable_write_cache);
 int init_base_path(const char *dir);
 
-int add_vdi(uint32_t epoch, char *data, int data_len, uint64_t size,
-	    uint32_t *new_vid, uint32_t base_vid, uint32_t copies,
-	    int is_snapshot, unsigned int *nr_copies);
+int add_vdi(struct vnode_info *vnode_info, uint32_t epoch, char *data,
+		int data_len, uint64_t size, uint32_t *new_vid,
+		uint32_t base_vid, uint32_t copies, int is_snapshot,
+		unsigned int *nr_copies);
 
-int del_vdi(uint32_t epoch, char *data, int data_len, uint32_t *vid,
-	    uint32_t snapid, unsigned int *nr_copies);
+int del_vdi(struct vnode_info *vnode_info, uint32_t epoch, char *data,
+		int data_len, uint32_t *vid, uint32_t snapid,
+		unsigned int *nr_copies);
 
-int lookup_vdi(uint32_t epoch, char *name, char *tag, uint32_t *vid,
-	       uint32_t snapid, unsigned int *nr_copies, uint64_t *ctime);
+int lookup_vdi(struct vnode_info *vnode_info, uint32_t epoch, char *name,
+		char *tag, uint32_t *vid, uint32_t snapid,
+		unsigned int *nr_copies, uint64_t *ctime);
 
 int read_vdis(char *data, int len, unsigned int *rsp_len);
 
-int get_vdi_attr(uint32_t epoch, struct sheepdog_vdi_attr *vattr, int data_len,
-		 uint32_t vid, uint32_t *attrid, int copies, uint64_t ctime,
-		 int write, int excl, int delete);
+int get_vdi_attr(struct vnode_info *vnode_info, uint32_t epoch,
+		struct sheepdog_vdi_attr *vattr, int data_len, uint32_t vid,
+		uint32_t *attrid, int copies, uint64_t ctime, int write,
+		int excl, int delete);
 
-int get_zones_nr_from(struct sd_node *nodes, int nr_nodes);
+int local_get_node_list(const struct sd_req *req, struct sd_rsp *rsp,
+		void *data);
+
+bool have_enough_zones(void);
+struct vnode_info *grab_vnode_info(struct vnode_info *vnode_info);
 struct vnode_info *get_vnode_info(void);
 void put_vnode_info(struct vnode_info *vnodes);
+struct vnode_info *get_vnode_info_epoch(uint32_t epoch);
 
 struct sd_vnode *oid_to_vnode(struct vnode_info *vnode_info, uint64_t oid,
 		int copy_idx);
+void oid_to_vnodes(struct vnode_info *vnode_info, uint64_t oid, int nr_copies,
+		struct sd_vnode **vnodes);
 int get_nr_copies(struct vnode_info *vnode_info);
 
-int is_access_to_busy_objects(uint64_t oid);
-
 void resume_pending_requests(void);
+void resume_wait_epoch_requests(void);
+void resume_wait_obj_requests(uint64_t oid);
+void resume_wait_recovery_requests(void);
+void flush_wait_obj_requests(void);
 
 int create_cluster(int port, int64_t zone, int nr_vnodes);
 int leave_cluster(void);
 
-void process_request_event_queues(void);
+void queue_cluster_request(struct request *req);
 void do_io_request(struct work *work);
+void do_gateway_request(struct work *work);
 int forward_write_obj_req(struct request *req);
+int forward_read_obj_req(struct request *req);
 
 int read_epoch(uint32_t *epoch, uint64_t *ctime,
 	       struct sd_node *entries, int *nr_entries);
-void do_cluster_request(struct work *work);
 
-int update_epoch_store(uint32_t epoch);
-int update_epoch_log(uint32_t epoch);
+int update_epoch_log(uint32_t epoch, struct sd_node *nodes, size_t nr_nodes);
+int log_current_epoch(void);
 
 int set_cluster_copies(uint8_t copies);
 int get_cluster_copies(uint8_t *copies);
@@ -288,9 +283,11 @@ int set_cluster_ctime(uint64_t ctime);
 uint64_t get_cluster_ctime(void);
 int get_obj_list(const struct sd_list_req *, struct sd_list_rsp *, void *);
 
-int start_recovery(uint32_t epoch);
+int start_recovery(struct vnode_info *cur_vnodes,
+	struct vnode_info *old_vnodes);
 void resume_recovery_work(void);
-int is_recoverying_oid(uint64_t oid);
+bool oid_in_recovery(uint64_t oid);
+int is_recovery_init(void);
 int node_in_recovery(void);
 
 int write_object(struct vnode_info *vnodes, uint32_t node_version,
@@ -301,18 +298,16 @@ int read_object(struct vnode_info *vnodes, uint32_t node_version,
 		uint64_t offset, int nr);
 int remove_object(struct vnode_info *vnodes, uint32_t node_version,
 		  uint64_t oid, int nr);
-int merge_objlist(uint64_t *list1, int nr_list1, uint64_t *list2, int nr_list2);
 
 void del_sheep_fd(int fd);
 int get_sheep_fd(uint8_t *addr, uint16_t port, int node_idx, uint32_t epoch);
 
-int rmdir_r(char *dir_path);
-
 int prealloc(int fd, uint32_t size);
 
-int init_objlist_cache(void);
-int objlist_cache_rb_remove(struct rb_root *root, uint64_t oid);
-int check_and_insert_objlist_cache(uint64_t oid);
+int objlist_cache_insert(uint64_t oid);
+void objlist_cache_remove(uint64_t oid);
+
+void req_done(struct request *req);
 
 /* Operations */
 
@@ -323,10 +318,10 @@ int is_io_op(struct sd_op_template *op);
 int is_force_op(struct sd_op_template *op);
 int has_process_work(struct sd_op_template *op);
 int has_process_main(struct sd_op_template *op);
-int do_process_work(struct sd_op_template *op, const struct sd_req *req,
-		    struct sd_rsp *rsp, void *data);
+int do_process_work(struct request *req);
 int do_process_main(struct sd_op_template *op, const struct sd_req *req,
 		    struct sd_rsp *rsp, void *data);
+int do_local_io(struct request *req, uint32_t epoch);
 
 /* Journal */
 struct jrnl_descriptor *jrnl_begin(const void *buf, size_t count, off_t offset,
@@ -404,45 +399,20 @@ static inline int sys_can_halt(void)
 }
 
 /* object_cache */
-/*
- * Object Cache ID
- *
- *  0 - 19 (20 bits): data object space
- *  20 - 27 (8 bits): reserved
- *  28 - 31 (4 bits): object type indentifier space
- */
 
-#define CACHE_VDI_SHIFT       31
-#define CACHE_VDI_BIT         (UINT32_C(1) << CACHE_VDI_SHIFT)
-
-struct object_cache {
-	uint32_t vid;
-	struct hlist_node hash;
-
-	struct list_head dirty_lists[2];
-	struct list_head *active_dirty_list;
-
-	struct rb_root dirty_trees[2];
-	struct rb_root *active_dirty_tree;
-
-	pthread_mutex_t lock;
-};
-
-struct object_cache_entry {
-	uint32_t idx;
-	struct rb_node rb;
-	struct list_head list;
-	int create;
-};
-
-struct object_cache *find_object_cache(uint32_t vid, int create);
-int object_cache_lookup(struct object_cache *oc, uint32_t index, int create);
-int object_cache_rw(struct object_cache *oc, uint32_t idx, struct request *);
-int object_cache_pull(struct object_cache *oc, uint32_t index);
-int object_cache_push(struct object_cache *oc);
-int object_cache_init(const char *p);
+int bypass_object_cache(struct request *req);
 int object_is_cached(uint64_t oid);
+
+int object_cache_handle_request(struct request *req);
+int object_cache_write(uint64_t oid, char *data, unsigned int datalen,
+		uint64_t offset, uint16_t flags, int copies, uint32_t epoch,
+		int create);
+int object_cache_read(uint64_t oid, char *data, unsigned int datalen,
+		uint64_t offset, int copies, uint32_t epoch);
+int object_cache_flush_vdi(struct request *req);
+int object_cache_flush_and_del(struct request *req);
 void object_cache_delete(uint32_t vid);
-int object_cache_flush_and_delete(struct object_cache *oc);
+
+int object_cache_init(const char *p);
 
 #endif

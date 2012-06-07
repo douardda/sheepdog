@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <sys/file.h>
@@ -24,7 +25,6 @@
 #include "work.h"
 
 #define MAX_EVENTS 500
-#define MAX_EVENT_BUF_SIZE (64 * 1024)
 
 const char *shmfile = "/tmp/sheepdog_shm";
 static int shmfd;
@@ -32,11 +32,11 @@ static int sigfd;
 static int event_pos;
 static struct sd_node this_node;
 
-static struct work_queue *local_block_wq;
-
 enum local_event_type {
-	EVENT_JOIN = 1,
+	EVENT_JOIN_REQUEST = 1,
+	EVENT_JOIN_RESPONSE,
 	EVENT_LEAVE,
+	EVENT_BLOCK,
 	EVENT_NOTIFY,
 };
 
@@ -45,7 +45,7 @@ struct local_event {
 	struct sd_node sender;
 
 	size_t buf_len;
-	uint8_t buf[MAX_EVENT_BUF_SIZE];
+	uint8_t buf[SD_MAX_EVENT_BUF_SIZE];
 
 	size_t nr_nodes; /* the number of sheep processes */
 	struct sd_node nodes[SD_MAX_NODES];
@@ -53,10 +53,7 @@ struct local_event {
 
 	enum cluster_join_result join_result;
 
-	void (*block_cb)(void *arg);
-
-	int blocked; /* set non-zero when sheep must block this event */
-	int callbacked; /* set non-zero if sheep already called block_cb() */
+	int callbacked; /* set non-zero after sd_block_handler() was called */
 };
 
 
@@ -201,7 +198,6 @@ static void shm_queue_init(void)
 	else {
 		/* initialize shared memory */
 		event_pos = 0;
-		memset(shm_queue, 0, sizeof(*shm_queue));
 		ret = ftruncate(shmfd, 0);
 		assert(ret == 0);
 		ret = ftruncate(shmfd, sizeof(*shm_queue));
@@ -213,9 +209,8 @@ static void shm_queue_init(void)
 	shm_queue_unlock();
 }
 
-static void add_event(enum local_event_type type,
-		      struct sd_node *node, void *buf,
-		      size_t buf_len, void (*block_cb)(void *arg))
+static void add_event(enum local_event_type type, struct sd_node *node,
+		void *buf, size_t buf_len)
 {
 	int idx;
 	struct sd_node *n;
@@ -232,8 +227,7 @@ static void add_event(enum local_event_type type,
 	ev.nr_nodes = get_nodes(ev.nodes, ev.pids);
 
 	switch (type) {
-	case EVENT_JOIN:
-		ev.blocked = 1;
+	case EVENT_JOIN_REQUEST:
 		ev.nodes[ev.nr_nodes] = *node;
 		ev.pids[ev.nr_nodes] = getpid(); /* must be local node */
 		ev.nr_nodes++;
@@ -250,9 +244,10 @@ static void add_event(enum local_event_type type,
 		memmove(p, p + 1, sizeof(*p) * (ev.nr_nodes - idx));
 		break;
 	case EVENT_NOTIFY:
-		ev.blocked = !!block_cb;
-		ev.block_cb = block_cb;
+	case EVENT_BLOCK:
 		break;
+	case EVENT_JOIN_RESPONSE:
+		abort();
 	}
 
 	shm_queue_push(&ev);
@@ -273,7 +268,7 @@ static void check_pids(void *arg)
 
 	for (i = 0; i < nr; i++)
 		if (!process_exists(pids[i]))
-			add_event(EVENT_LEAVE, nodes + i, NULL, 0, NULL);
+			add_event(EVENT_LEAVE, nodes + i, NULL, 0);
 
 	shm_queue_unlock();
 
@@ -283,9 +278,161 @@ static void check_pids(void *arg)
 
 /* Local driver APIs */
 
-static int local_init(const char *option, uint8_t *myaddr)
+static int local_join(struct sd_node *myself,
+		      void *opaque, size_t opaque_len)
+{
+	this_node = *myself;
+
+	shm_queue_lock();
+
+	add_event(EVENT_JOIN_REQUEST, &this_node, opaque, opaque_len);
+
+	shm_queue_unlock();
+
+	return 0;
+}
+
+static int local_leave(void)
+{
+	shm_queue_lock();
+
+	add_event(EVENT_LEAVE, &this_node, NULL, 0);
+
+	shm_queue_unlock();
+
+	return 0;
+}
+
+static int local_notify(void *msg, size_t msg_len)
+{
+	shm_queue_lock();
+
+	add_event(EVENT_NOTIFY, &this_node, msg, msg_len);
+
+	shm_queue_unlock();
+
+	return 0;
+}
+
+static void local_block(void)
+{
+	shm_queue_lock();
+
+	add_event(EVENT_BLOCK, &this_node, NULL, 0);
+
+	shm_queue_unlock();
+}
+
+static void local_unblock(void *msg, size_t msg_len)
+{
+	struct local_event *ev;
+
+	shm_queue_lock();
+
+	ev = shm_queue_peek();
+
+	ev->type = EVENT_NOTIFY;
+	ev->buf_len = msg_len;
+	if (msg)
+		memcpy(ev->buf, msg, msg_len);
+	msync(ev, sizeof(*ev), MS_SYNC);
+
+	shm_queue_notify();
+
+	shm_queue_unlock();
+}
+
+static void local_handler(int listen_fd, int events, void *data)
+{
+	struct signalfd_siginfo siginfo;
+	struct local_event *ev;
+	enum cluster_join_result res;
+	int ret;
+
+	if (events & EPOLLHUP) {
+		eprintf("local driver received EPOLLHUP event, exiting.\n");
+		log_close();
+		exit(1);
+	}
+
+	dprintf("read siginfo\n");
+
+	ret = read(sigfd, &siginfo, sizeof(siginfo));
+	assert(ret == sizeof(siginfo));
+
+	shm_queue_lock();
+
+	ev = shm_queue_peek();
+	if (!ev)
+		goto out;
+
+	switch (ev->type) {
+	case EVENT_JOIN_REQUEST:
+		if (!node_eq(&ev->nodes[0], &this_node))
+			break;
+
+		res = sd_check_join_cb(&ev->sender, ev->buf);
+		ev->join_result = res;
+		ev->type = EVENT_JOIN_RESPONSE;
+		msync(ev, sizeof(*ev), MS_SYNC);
+
+		shm_queue_notify();
+
+		if (res == CJ_RES_MASTER_TRANSFER) {
+			eprintf("failed to join sheepdog cluster: "
+				"please retry when master is up\n");
+			shm_queue_unlock();
+			exit(1);
+		}
+		break;
+	case EVENT_JOIN_RESPONSE:
+		if (ev->join_result == CJ_RES_MASTER_TRANSFER) {
+			/* FIXME: This code is tricky, but Sheepdog assumes that */
+			/* nr_nodes = 1 when join_result = MASTER_TRANSFER... */
+			ev->nr_nodes = 1;
+			ev->nodes[0] = this_node;
+			ev->pids[0] = getpid();
+
+			shm_queue_set_chksum();
+		}
+
+		sd_join_handler(&ev->sender, ev->nodes, ev->nr_nodes,
+				    ev->join_result, ev->buf);
+		shm_queue_pop();
+		break;
+	case EVENT_LEAVE:
+		sd_leave_handler(&ev->sender, ev->nodes, ev->nr_nodes);
+		shm_queue_pop();
+		break;
+	case EVENT_BLOCK:
+		if (node_eq(&ev->sender, &this_node) && !ev->callbacked) {
+			sd_block_handler();
+			ev->callbacked = 1;
+		}
+		break;
+	case EVENT_NOTIFY:
+		sd_notify_handler(&ev->sender, ev->buf, ev->buf_len);
+		shm_queue_pop();
+		break;
+	}
+
+out:
+	shm_queue_unlock();
+}
+
+static int local_get_local_addr(uint8_t *myaddr)
+{
+	/* set 127.0.0.1 */
+	memset(myaddr, 0, 16);
+	myaddr[12] = 127;
+	myaddr[15] = 1;
+	return 0;
+}
+
+static int local_init(const char *option)
 {
 	sigset_t mask;
+	int ret;
 	static struct timer t = {
 		.callback = check_pids,
 		.data = &t,
@@ -293,11 +440,6 @@ static int local_init(const char *option, uint8_t *myaddr)
 
 	if (option)
 		shmfile = option;
-
-	/* set 127.0.0.1 */
-	memset(myaddr, 0, 16);
-	myaddr[12] = 127;
-	myaddr[15] = 1;
 
 	shm_queue_init();
 
@@ -313,160 +455,25 @@ static int local_init(const char *option, uint8_t *myaddr)
 
 	add_timer(&t, 1);
 
-	local_block_wq = init_work_queue(1);
-	if (!local_block_wq) {
-		eprintf("failed to create local workqueue: %m\n");
+	ret = register_event(sigfd, local_handler, NULL);
+	if (ret) {
+		eprintf("failed to register local event handler (%d)\n", ret);
 		return -1;
 	}
-
-	return sigfd;
-}
-
-static int local_join(struct sd_node *myself,
-		      void *opaque, size_t opaque_len)
-{
-	this_node = *myself;
-
-	shm_queue_lock();
-
-	add_event(EVENT_JOIN, &this_node, opaque, opaque_len, NULL);
-
-	shm_queue_unlock();
-
-	return 0;
-}
-
-static int local_leave(void)
-{
-	shm_queue_lock();
-
-	add_event(EVENT_LEAVE, &this_node, NULL, 0, NULL);
-
-	shm_queue_unlock();
-
-	return 0;
-}
-
-static int local_notify(void *msg, size_t msg_len, void (*block_cb)(void *arg))
-{
-	shm_queue_lock();
-
-	add_event(EVENT_NOTIFY, &this_node, msg, msg_len, block_cb);
-
-	shm_queue_unlock();
-
-	return 0;
-}
-
-static void local_block(struct work *work)
-{
-	struct local_event *ev;
-
-	shm_queue_lock();
-
-	ev = shm_queue_peek();
-
-	ev->block_cb(ev->buf);
-	ev->blocked = 0;
-	msync(ev, sizeof(*ev), MS_SYNC);
-
-	shm_queue_notify();
-
-	shm_queue_unlock();
-}
-
-static void local_block_done(struct work *work)
-{
-}
-
-static int local_dispatch(void)
-{
-	int ret;
-	struct signalfd_siginfo siginfo;
-	struct local_event *ev;
-	enum cluster_join_result res;
-	static struct work work = {
-		.fn = local_block,
-		.done = local_block_done,
-	};
-
-	dprintf("read siginfo\n");
-	ret = read(sigfd, &siginfo, sizeof(siginfo));
-	assert(ret == sizeof(siginfo));
-
-	shm_queue_lock();
-
-	ev = shm_queue_peek();
-	if (!ev)
-		goto out;
-
-	switch (ev->type) {
-	case EVENT_JOIN:
-		if (ev->blocked) {
-			if (node_cmp(&ev->nodes[0], &this_node) == 0) {
-				res = sd_check_join_cb(&ev->sender, ev->buf);
-				ev->join_result = res;
-				ev->blocked = 0;
-				msync(ev, sizeof(*ev), MS_SYNC);
-
-				shm_queue_notify();
-
-				if (res == CJ_RES_MASTER_TRANSFER) {
-					eprintf("failed to join sheepdog cluster: please retry when master is up\n");
-					shm_queue_unlock();
-					exit(1);
-				}
-			}
-			goto out;
-		}
-
-		if (ev->join_result == CJ_RES_MASTER_TRANSFER) {
-			/* FIXME: This code is tricky, but Sheepdog assumes that */
-			/* nr_nodes = 1 when join_result = MASTER_TRANSFER... */
-			ev->nr_nodes = 1;
-			ev->nodes[0] = this_node;
-			ev->pids[0] = getpid();
-
-			shm_queue_set_chksum();
-		}
-
-		sd_join_handler(&ev->sender, ev->nodes, ev->nr_nodes,
-				    ev->join_result, ev->buf);
-		break;
-	case EVENT_LEAVE:
-		sd_leave_handler(&ev->sender, ev->nodes, ev->nr_nodes);
-		break;
-	case EVENT_NOTIFY:
-		if (ev->blocked) {
-			if (node_cmp(&ev->sender, &this_node) == 0) {
-				if (!ev->callbacked) {
-					queue_work(local_block_wq, &work);
-
-					ev->callbacked = 1;
-				}
-			}
-			goto out;
-		}
-
-		sd_notify_handler(&ev->sender, ev->buf, ev->buf_len);
-		break;
-	}
-
-	shm_queue_pop();
-out:
-	shm_queue_unlock();
 
 	return 0;
 }
 
 struct cluster_driver cdrv_local = {
-	.name       = "local",
+	.name		= "local",
 
-	.init       = local_init,
-	.join       = local_join,
-	.leave      = local_leave,
-	.notify     = local_notify,
-	.dispatch   = local_dispatch,
+	.init		= local_init,
+	.get_local_addr	= local_get_local_addr,
+	.join		= local_join,
+	.leave		= local_leave,
+	.notify		= local_notify,
+	.block		= local_block,
+	.unblock	= local_unblock,
 };
 
 cdrv_register(cdrv_local);
